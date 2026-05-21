@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Свод таблицы по ТТ из выгрузки</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script
+      defer
+      src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"
+    ></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Свод по торговым точкам</h1>
+        <p class="lead">
+          Вставьте таблицу из Excel или выберите файл <code>.xlsx</code>. Укажите номер
+          <strong>очереди</strong>, нажмите «Сгенерировать результат»: в таблице не будет столбцов «Заказ» и «Адрес из
+          заказа», колонка «Дата открытия из заказа» остаётся пустой (дата считается только в «Дата открытия»).
+        </p>
+      </header>
+
+      <section class="panel">
+        <h2>Входные данные</h2>
+        <textarea
+          id="paste"
+          class="paste"
+          placeholder="Ctrl+V из Excel здесь или загрузите файл ниже…"
+          spellcheck="false"
+          rows="14"
+        ></textarea>
+        <div class="queue-row" style="margin-top: 0.85rem">
+          <label class="queue-label">
+            Очередь
+            <input type="text" id="queue-input" inputmode="numeric" placeholder="например 56" autocomplete="off" />
+          </label>
+        </div>
+        <div class="grid-actions" style="margin-top: 0.85rem">
+          <label tabindex="0" class="file-label btn-like">
+            <input id="file-xlsx" type="file" accept=".xlsx,.xls,.xlsm" hidden />
+            <span>Выбрать файл</span>
+          </label>
+          <button type="button" class="primary generate-btn" id="btn-generate">Сгенерировать результат</button>
+        </div>
+        <p class="hint" id="warn-xlsx"></p>
+        <p class="hint" id="meta-line"></p>
+      </section>
+
+      <section class="panel">
+        <h2>Результат</h2>
+        <div id="warnings-block" class="warnings-block muted" hidden>
+          <strong>Предупреждения:</strong>
+          <ul id="warnings-ul"></ul>
+        </div>
+        <div class="grid-actions">
+          <button type="button" id="btn-copy-tsv">Скопировать TSV</button>
+          <button type="button" class="primary" id="btn-download-csv">Скачать CSV</button>
+          <button type="button" class="primary" id="btn-download-xlsx">Скачать Excel</button>
+        </div>
+        <div id="preview-wrap" style="margin-top: 0.75rem">
+          <table class="preview">
+            <thead>
+              <tr id="thead-row"></tr>
+            </thead>
+            <tbody id="tbody"></tbody>
+          </table>
+        </div>
+        <p class="error-text" id="error-msg"></p>
+      </section>
+
+      <footer>
+        После изменений исходников выполните
+        <code>npm run build</code>
+        или
+        <code>npx esbuild app.js --bundle --format=iife --platform=browser --outfile=svod.iife.js</code>, затем откройте эту страницу (дважды клик по <code>index.html</code> тоже работает).
+      </footer>
+    </main>
+
+    <script defer src="./svod.iife.js"></script>
+  </body>
+</html>

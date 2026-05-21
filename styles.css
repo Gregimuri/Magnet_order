@@ -1,0 +1,273 @@
+:root {
+  --bg: #0f1419;
+  --surface: #1a232e;
+  --border: #2d3b4f;
+  --text: #e7ecf3;
+  --muted: #8b98a8;
+  --accent: #3d8bfd;
+  --warn-bg: rgba(245, 158, 11, 0.12);
+  --warn-border: #d97706;
+  --danger: #f87171;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family:
+    system-ui,
+    Segoe UI,
+    Roboto,
+    Ubuntu,
+    Cantarell,
+    "Noto Sans",
+    sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.45;
+}
+
+main {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 1.25rem 1rem 3rem;
+}
+
+header h1 {
+  font-size: 1.35rem;
+  font-weight: 650;
+  margin: 0 0 0.35rem;
+}
+
+header p.lead {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
+section.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1rem;
+  margin-top: 1rem;
+}
+
+section.panel h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.grid-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  align-items: center;
+  margin-top: 0.75rem;
+}
+
+label.checkbox {
+  display: inline-flex;
+  gap: 0.4rem;
+  align-items: center;
+  font-size: 0.92rem;
+  color: var(--muted);
+}
+
+input[type='text'],
+input[type='number'],
+textarea {
+  font: inherit;
+  color: inherit;
+  background: #111822;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.5rem 0.65rem;
+  width: 100%;
+}
+
+input[type='number'],
+input.smallnum {
+  max-width: 8rem;
+}
+
+textarea.paste {
+  min-height: 160px;
+  font-family: var(--mono);
+  font-size: 0.8rem;
+}
+
+.settings-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 0.85rem;
+  align-items: end;
+}
+
+.settings-row label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.88rem;
+  color: var(--muted);
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: #243044;
+  color: var(--text);
+  padding: 0.45rem 0.85rem;
+  border-radius: 8px;
+}
+
+button:hover {
+  background: #2c3a54;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: #2968c9;
+  color: #fff;
+}
+
+button.primary:hover {
+  filter: brightness(1.06);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+input[type='file'] {
+  max-width: 100%;
+}
+
+#warnings ul {
+  margin: 0.25rem 0 0;
+  padding-left: 1.25rem;
+  font-size: 0.88rem;
+  color: #fec272;
+}
+
+#preview-wrap {
+  overflow: auto;
+  max-height: 55vh;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+table.preview {
+  border-collapse: collapse;
+  font-size: 0.78rem;
+  min-width: 100%;
+}
+
+table.preview th,
+table.preview td {
+  border: 1px solid var(--border);
+  padding: 0.35rem 0.45rem;
+  vertical-align: top;
+  white-space: nowrap;
+}
+
+table.preview thead th {
+  position: sticky;
+  top: 0;
+  background: #253044;
+  z-index: 1;
+}
+
+tr.warn-row td {
+  background: var(--warn-bg);
+  box-shadow: inset 4px 0 0 var(--warn-border);
+}
+
+.hint {
+  font-size: 0.82rem;
+  color: var(--muted);
+  margin-top: 0.35rem;
+}
+
+.error-text {
+  color: var(--danger);
+  margin-top: 0.35rem;
+  font-size: 0.9rem;
+}
+
+code {
+  font-family: var(--mono);
+  font-size: 0.85em;
+  background: #111822;
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+
+.queue-row {
+  max-width: 16rem;
+}
+
+.queue-label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.88rem;
+  color: var(--muted);
+}
+
+.queue-row input[type='text'] {
+  font-weight: 500;
+  color: var(--text);
+}
+
+.warnings-block {
+  margin-bottom: 0.75rem;
+  font-size: 0.9rem;
+}
+
+.warnings-block.muted strong {
+  color: var(--muted);
+}
+
+.generate-btn {
+  padding: 0.55rem 1.1rem;
+  font-weight: 600;
+}
+
+.file-label.btn-like {
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+}
+
+.file-label span {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--border);
+  background: #243044;
+  color: var(--text);
+  padding: 0.45rem 0.85rem;
+  border-radius: 8px;
+}
+
+.file-label span:hover {
+  background: #2c3a54;
+}
+
+footer {
+  margin-top: 1.25rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+}

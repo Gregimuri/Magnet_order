@@ -1,0 +1,8 @@
+{
+  "name": "svod-tt",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "npx --yes esbuild app.js --bundle --format=iife --platform=browser --outfile=svod.iife.js"
+  }
+}
