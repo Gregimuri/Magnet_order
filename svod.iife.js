@@ -531,6 +531,7 @@
   function enrichOrderRecords(orderRecords, index, warnings = []) {
     const warnedTt = /* @__PURE__ */ new Set();
     return orderRecords.map((rec) => {
+      const orderRegion = deriveRegion(rec.address) || String(rec.regionHint ?? "").trim();
       const info = index.get(rec.tt);
       if (!info) {
         if (isAddressIncomplete(rec.address) && !warnedTt.has(rec.tt)) {
@@ -539,9 +540,13 @@
             `\u041D\u0435\u043F\u043E\u043B\u043D\u044B\u0439 \u0430\u0434\u0440\u0435\u0441 \u0438 \u043D\u0435\u0442 \u0441\u0442\u0440\u043E\u043A\u0438 \u0432 \u0432\u044B\u0433\u0440\u0443\u0437\u043A\u0435 \u043C\u043E\u043D\u0442\u0430\u0436\u0435\u0439 \u0434\u043B\u044F \xAB${rec.tt}\xBB: "${rec.address}"`
           );
         }
-        return { ...rec, dates: [rec.date1, rec.date2].filter(Boolean) };
+        return {
+          ...rec,
+          regionHint: orderRegion,
+          dates: [rec.date1, rec.date2].filter(Boolean)
+        };
       }
-      const next = { ...rec };
+      const next = { ...rec, regionHint: orderRegion };
       if (isAddressIncomplete(rec.address) && info.address) {
         if (!warnedTt.has(`fix:${rec.tt}`)) {
           warnedTt.add(`fix:${rec.tt}`);
@@ -550,6 +555,7 @@
           );
         }
         next.address = info.address;
+        if (!next.regionHint) next.regionHint = deriveRegion(info.address);
       }
       if (!next.format && info.format) next.format = info.format;
       if (!next.area && info.area) next.area = info.area;
@@ -579,6 +585,7 @@
           pivotCounts: Object.fromEntries(PIVOT_WORK_TYPES.map((k) => [k, 0])),
           addressSample: "",
           addressConflict: false,
+          regionHints: [],
           areaValues: [],
           dateVals: [],
           formats: [],
@@ -603,6 +610,8 @@
         if (!agg.addressSample) agg.addressSample = addr;
         else if (addr !== agg.addressSample) agg.addressConflict = true;
       }
+      const regionHint = String(rec.regionHint ?? "").trim() || deriveRegion(addr);
+      if (regionHint) agg.regionHints.push(regionHint);
       const areaNum = parseArea(rec.area);
       if (areaNum != null) agg.areaValues.push(areaNum);
       const dateRawList = Array.isArray(rec.dates) && rec.dates.length ? rec.dates : [rec.date1, rec.date2];
@@ -633,7 +642,7 @@
       const agg = groupMap.get(tt);
       if (!agg) continue;
       const addr = agg.addressSample;
-      const region = deriveRegion(addr);
+      const region = (agg.regionHints || []).find((r) => String(r ?? "").trim()) || deriveRegion(addr);
       const fmt = [...new Set(agg.formats)].length === 1 ? agg.formats[0] : agg.formats[0] ?? "";
       const openTs = maxDateTimestamps(agg.dateVals);
       const openStr = formatRuDate(openTs);
@@ -729,6 +738,7 @@
     } else if (orderRecords.length) {
       records = orderRecords.map((r) => ({
         ...r,
+        regionHint: deriveRegion(r.address) || String(r.regionHint ?? "").trim(),
         dates: [r.date1, r.date2].filter(Boolean)
       }));
       mode = "zakaz";

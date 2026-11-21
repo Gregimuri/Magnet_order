@@ -95,6 +95,7 @@ export const ZAKAZ_COLUMN_MAP = {
  * @property {string} [date2]
  * @property {string[]} [dates] — все даты позиции (заказ + выгрузка)
  * @property {string} [format]
+ * @property {string} [regionHint] — область из адреса заказа (сохраняется при дозаполнении улицы)
  */
 
 /**
@@ -624,6 +625,7 @@ export function maxDateTimestamps(timestamps) {
  * @property {Record<string, number>} pivotCounts
  * @property {string} addressSample
  * @property {boolean} addressConflict
+ * @property {string[]} regionHints
  * @property {number[]} areaValues
  * @property {(number|null)[]} dateVals
  * @property {string[]} formats
@@ -899,6 +901,8 @@ export function buildTtEnrichmentIndex(montageRecords) {
 export function enrichOrderRecords(orderRecords, index, warnings = []) {
   const warnedTt = new Set();
   return orderRecords.map((rec) => {
+    /** Область считаем по адресу заказа и сохраняем даже если улицу дозаполнили из монтажей. */
+    const orderRegion = deriveRegion(rec.address) || String(rec.regionHint ?? '').trim();
     const info = index.get(rec.tt);
     if (!info) {
       if (isAddressIncomplete(rec.address) && !warnedTt.has(rec.tt)) {
@@ -907,11 +911,15 @@ export function enrichOrderRecords(orderRecords, index, warnings = []) {
           `Неполный адрес и нет строки в выгрузке монтажей для «${rec.tt}»: "${rec.address}"`,
         );
       }
-      return { ...rec, dates: [rec.date1, rec.date2].filter(Boolean) };
+      return {
+        ...rec,
+        regionHint: orderRegion,
+        dates: [rec.date1, rec.date2].filter(Boolean),
+      };
     }
 
-    const next = { ...rec };
-    /** Адрес (и область из него) — из заказа; выгрузка монтажей только если адрес неполный. */
+    const next = { ...rec, regionHint: orderRegion };
+    /** Улицу/дом из монтажей — только если адрес заказа неполный; область уже в regionHint. */
     if (isAddressIncomplete(rec.address) && info.address) {
       if (!warnedTt.has(`fix:${rec.tt}`)) {
         warnedTt.add(`fix:${rec.tt}`);
@@ -920,6 +928,7 @@ export function enrichOrderRecords(orderRecords, index, warnings = []) {
         );
       }
       next.address = info.address;
+      if (!next.regionHint) next.regionHint = deriveRegion(info.address);
     }
     /** Формат и площадь в заказе обычно нет — берём из монтажей. */
     if (!next.format && info.format) next.format = info.format;
@@ -966,6 +975,7 @@ export function groupAndAggregateRecords(records, warn = []) {
         pivotCounts: Object.fromEntries(PIVOT_WORK_TYPES.map((k) => [k, 0])),
         addressSample: '',
         addressConflict: false,
+        regionHints: [],
         areaValues: [],
         dateVals: [],
         formats: [],
@@ -994,6 +1004,9 @@ export function groupAndAggregateRecords(records, warn = []) {
       if (!agg.addressSample) agg.addressSample = addr;
       else if (addr !== agg.addressSample) agg.addressConflict = true;
     }
+
+    const regionHint = String(rec.regionHint ?? '').trim() || deriveRegion(addr);
+    if (regionHint) agg.regionHints.push(regionHint);
 
     const areaNum = parseArea(rec.area);
     if (areaNum != null) agg.areaValues.push(areaNum);
@@ -1056,7 +1069,8 @@ export function buildOutputRows(groupMap, opts = {}) {
     if (!agg) continue;
 
     const addr = agg.addressSample;
-    const region = deriveRegion(addr);
+    const region =
+      (agg.regionHints || []).find((r) => String(r ?? '').trim()) || deriveRegion(addr);
     const fmt = [...new Set(agg.formats)].length === 1 ? agg.formats[0] : agg.formats[0] ?? '';
     const openTs = maxDateTimestamps(agg.dateVals);
     const openStr = formatRuDate(openTs);
@@ -1190,6 +1204,7 @@ export function processAttachmentBundle(files, opts = {}) {
   } else if (orderRecords.length) {
     records = orderRecords.map((r) => ({
       ...r,
+      regionHint: deriveRegion(r.address) || String(r.regionHint ?? '').trim(),
       dates: [r.date1, r.date2].filter(Boolean),
     }));
     mode = 'zakaz';
