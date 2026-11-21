@@ -59,16 +59,20 @@ function generate() {
 
     const queueVal = $('queue-input').value.trim();
     const warns = [];
-    const { rows, warnings, warningsByTtFlags } = transformFromMatrix(matrix, {
-      queueDefault: queueVal,
-      columns: PARSE_OPTS_BASE.columns,
-      warnings: warns,
-    });
+    const { rows, warnings, warningsByTtFlags, inputKind, sourceRecords } = transformFromMatrix(
+      matrix,
+      {
+        queueDefault: queueVal,
+        columns: PARSE_OPTS_BASE.columns,
+        warnings: warns,
+      },
+    );
 
     lastResult = rows;
     lastWarnings = warnings;
     lastWarnFlags = warningsByTtFlags;
-    $('meta-line').textContent = `Готово: строк исходника ${matrix.length}, торговых точек ${rows.length}.`;
+    const kindLabel = inputKind === 'zakaz' ? 'заказ Magnit' : 'плоская выгрузка';
+    $('meta-line').textContent = `Готово (${kindLabel}): позиций ${sourceRecords ?? '—'}, торговых точек ${rows.length}.`;
     renderWarnings(lastWarnings);
     $('warnings-block').hidden = warnings.length === 0;
     renderTable();

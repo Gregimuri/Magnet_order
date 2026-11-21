@@ -1,5 +1,6 @@
 /**
- * Чистые функции преобразования строк выгрузки в свод по ТТ.
+ * Чистые функции преобразования заказа / выгрузки в свод по ТТ.
+ * Основной вход — файл заказа Magnit («Заказ1.xlsx» и аналоги): пары строк позиция+адрес.
  */
 
 /** Колонки результата (порядок как в образце). */
@@ -53,7 +54,10 @@ export function shouldIgnoreUnknownWorkWarning(workRaw) {
   return SILENT_SKIP_WORK_PATTERN.some((re) => re.test(w));
 }
 
-/** Настройки маппинга колонок исходника (индекс с 0). */
+/**
+ * Маппинг колонок старой плоской выгрузки (индекс с 0).
+ * Новый формат «Заказ» разбирается отдельно (см. extractZakazRecords).
+ */
 export const DEFAULT_COLUMN_MAP = {
   ttName: 0,
   orderRcc: 1,
@@ -66,10 +70,38 @@ export const DEFAULT_COLUMN_MAP = {
 };
 
 /**
+ * Колонки шаблона заказа Magnit (после разворота merged-ячеек SheetJS).
+ * 0 № п/п · 1 RCC · 5 Модель · 8 Кол-во · 12 Дата поставки · 13 Дата окончания монтажа · 14 Место/адрес
+ */
+export const ZAKAZ_COLUMN_MAP = {
+  rowNo: 0,
+  orderRcc: 1,
+  workType: 5,
+  quantity: 8,
+  date1: 12,
+  date2: 13,
+  placeOrAddress: 14,
+};
+
+/**
+ * @typedef {Object} SourceRecord
+ * @property {string} tt
+ * @property {string} rcc
+ * @property {string} workType
+ * @property {number} quantity
+ * @property {string} address
+ * @property {string} [area]
+ * @property {string} [date1]
+ * @property {string} [date2]
+ * @property {string} [format]
+ */
+
+/**
  * @typedef {Object} TransformOptions
  * @property {string} [queueDefault] — номер очереди для всех строк результата
  * @property {boolean} [skipFirstRow=false] — трактовать первую строку как заголовок
  * @property {typeof DEFAULT_COLUMN_MAP} [columns]
+ * @property {'zakaz'|'legacy'|'auto'} [inputKind]
  */
 
 /**
@@ -353,9 +385,9 @@ export function deriveRegion(address) {
 
   if (
     /\bгород\s+Москва\b/iu.test(body) ||
-    (/(?:^|[\s,;])Москва\s*(?=,)/iu.test(body) &&
+    (/(?:^|[\s,;])Москва(?:\s*г\.?)?(?=[\s,;]|$)/iu.test(body) &&
       !mosOblastPhrase &&
-      !/\bМосковская\s+(?:область|обл)/iu.test(body))
+      !/Московская\s+(?:область|обл)/iu.test(body))
   )
     return 'Москва';
 
@@ -522,21 +554,180 @@ export function maxDateTimestamps(timestamps) {
  * @property {Set<string>} unknownWorkSeen
  */
 
+/** @param {string[]|undefined|null} cells */
+function normalizeCells(cells) {
+  return (cells || []).map((c) => String(c ?? '').replace(/\u00A0/g, ' ').trim());
+}
+
+/** Убирает «, КПП …» из «Место поставки». */
+export function stripTtPlaceExtras(place) {
+  return String(place ?? '')
+    .replace(/\u00A0/g, ' ')
+    .replace(/,\s*КПП\s*[\d\s]+$/iu, '')
+    .trim();
+}
+
 /**
  * @param {string[][]} rows
+ * @returns {'zakaz'|'legacy'}
+ */
+export function detectInputKind(rows) {
+  const head = rows
+    .slice(0, 50)
+    .map((r) => normalizeCells(r).join('\t'))
+    .join('\n');
+  if (/на основании спецификации/i.test(head)) return 'zakaz';
+  if (/№\s*п\s*\/\s*п/i.test(head) && /место поставки|номер заказа/i.test(head)) return 'zakaz';
+
+  let zakazHits = 0;
+  let legacyHits = 0;
+  for (const raw of rows) {
+    const cells = normalizeCells(raw);
+    if (!cells.length) continue;
+    if (/^\d+$/.test(cells[0] || '') && /^RCC-/i.test(cells[1] || '')) zakazHits += 1;
+    if (cells[0] && cells[0] !== 'ТТ' && /^RCC-/i.test(cells[1] || '') && !/^\d+$/.test(cells[0]))
+      legacyHits += 1;
+  }
+  if (zakazHits >= 2 && zakazHits >= legacyHits) return 'zakaz';
+  return 'legacy';
+}
+
+/**
+ * Разбор файла заказа Magnit: строка позиции + следующая строка с адресом.
+ * @param {string[][]} rows
+ * @returns {SourceRecord[]}
+ */
+export function extractZakazRecords(rows) {
+  const zm = ZAKAZ_COLUMN_MAP;
+  /** @type {SourceRecord[]} */
+  const out = [];
+
+  for (let i = 0; i < rows.length; i += 1) {
+    const cells = normalizeCells(rows[i]);
+    if (!/^\d+$/.test(cells[zm.rowNo] || '')) continue;
+    const rcc = cells[zm.orderRcc] || '';
+    if (!/^RCC-/i.test(rcc)) continue;
+
+    let workType = cells[zm.workType] || '';
+    if (!workType || /^модель$/i.test(workType)) {
+      workType = cells.find((c) => PIVOT_WORK_TYPES.includes(c)) || workType;
+    }
+    if (!workType || /^модель$/i.test(workType) || /^наименование$/i.test(workType)) continue;
+
+    const qtyRaw = String(cells[zm.quantity] ?? '').replace(/\s/g, '');
+    let quantity = parseInt(qtyRaw, 10);
+    if (!Number.isFinite(quantity)) {
+      quantity = 0;
+      const wi = cells.indexOf(workType);
+      if (wi >= 0) {
+        for (let j = wi + 1; j < cells.length; j += 1) {
+          const n = parseInt(String(cells[j]).replace(/\s/g, ''), 10);
+          if (Number.isFinite(n) && n > 0 && n < 100000) {
+            quantity = n;
+            break;
+          }
+        }
+      }
+    }
+
+    const tt = stripTtPlaceExtras(cells[zm.placeOrAddress] || '');
+    if (!tt || /^адрес/i.test(tt) || /^место/i.test(tt)) continue;
+
+    let address = '';
+    if (i + 1 < rows.length) {
+      const next = normalizeCells(rows[i + 1]);
+      const nextIsData = /^\d+$/.test(next[zm.rowNo] || '') && /^RCC-/i.test(next[zm.orderRcc] || '');
+      const nextIsHeader =
+        /^№\s*п/i.test(next[0] || '') || /^номер заказа$/i.test(String(next[1] || '').toLowerCase());
+      if (!nextIsData && !nextIsHeader) {
+        const cand =
+          next[zm.placeOrAddress] ||
+          next.find((c, idx) => idx >= 12 && c && !/^адрес/i.test(c) && !/^место/i.test(c)) ||
+          '';
+        if (
+          cand &&
+          cand !== tt &&
+          !/^за счет/i.test(cand) &&
+          !/^CNT-/i.test(cand) &&
+          !/^RCC-/i.test(cand)
+        ) {
+          address = cand;
+        }
+      }
+    }
+
+    out.push({
+      tt,
+      rcc,
+      workType,
+      quantity: Number.isFinite(quantity) ? quantity : 0,
+      address,
+      area: '',
+      date1: cells[zm.date1] || '',
+      date2: cells[zm.date2] || '',
+      format: '',
+    });
+  }
+
+  return out;
+}
+
+/**
+ * Старая плоская выгрузка монтажей (одна строка = одна позиция).
+ * @param {string[][]} rows
  * @param {Partial<typeof DEFAULT_COLUMN_MAP>} col
+ * @returns {SourceRecord[]}
+ */
+export function extractLegacyRecords(rows, col = {}) {
+  const cm = { ...DEFAULT_COLUMN_MAP, ...col };
+  /** @type {SourceRecord[]} */
+  const out = [];
+  const getCell = (cells, idx) =>
+    typeof idx === 'number' && idx >= 0 ? String(cells[idx] ?? '').trim() : '';
+
+  for (const raw of rows) {
+    const cells = normalizeCells(raw);
+    const tt = getCell(cells, cm.ttName);
+    if (!tt || tt === 'ТТ' || tt === 'Название ТТ') continue;
+    const workType = getCell(cells, cm.workType);
+    if (workType === 'Модель') continue;
+    const qty = parseInt(getCell(cells, cm.quantity), 10);
+    out.push({
+      tt,
+      rcc: getCell(cells, cm.orderRcc),
+      workType,
+      quantity: Number.isFinite(qty) ? qty : 0,
+      address: getCell(cells, cm.address),
+      area: getCell(cells, cm.area),
+      date1: getCell(cells, cm.date1),
+      date2: getCell(cells, cm.date2),
+      format: lastNonEmptyCell(cells),
+    });
+  }
+  return out;
+}
+
+/**
+ * @param {string[][]} rows
+ * @param {TransformOptions} [opts]
+ */
+export function normalizeMatrixToRecords(rows, opts = {}) {
+  const kind =
+    opts.inputKind && opts.inputKind !== 'auto' ? opts.inputKind : detectInputKind(rows);
+  if (kind === 'zakaz') return { kind, records: extractZakazRecords(rows) };
+  return { kind: 'legacy', records: extractLegacyRecords(rows, opts.columns) };
+}
+
+/**
+ * @param {SourceRecord[]} records
  * @param {string[]} [warn]
  */
-export function groupAndAggregate(rows, col = {}, warn = []) {
-  const cm = { ...DEFAULT_COLUMN_MAP, ...col };
+export function groupAndAggregateRecords(records, warn = []) {
   /** @type {Map<string, ParsedRowAgg>} */
   const map = new Map();
 
-  const getCell = (cells, idx) =>
-    typeof idx === 'number' && idx >= 0 ? (cells[idx] ?? '').trim() : '';
-
-  for (const cells of rows) {
-    const tt = getCell(cells, cm.ttName);
+  for (const rec of records) {
+    const tt = String(rec.tt ?? '').trim();
     if (!tt) continue;
 
     let agg = map.get(tt);
@@ -555,13 +746,11 @@ export function groupAndAggregate(rows, col = {}, warn = []) {
       map.set(tt, agg);
     }
 
-    const rcc = getCell(cells, cm.orderRcc);
+    const rcc = String(rec.rcc ?? '').trim();
     if (rcc && rcc !== 'КА не монтирует' && !agg.rccSeen.includes(rcc)) agg.rccSeen.push(rcc);
 
-    const work = getCell(cells, cm.workType);
-    const qtyRaw = getCell(cells, cm.quantity);
-    const qty = parseInt(qtyRaw, 10);
-    const qtySafe = Number.isFinite(qty) ? qty : 0;
+    const work = String(rec.workType ?? '').trim();
+    const qtySafe = Number.isFinite(rec.quantity) ? rec.quantity : 0;
 
     if (PIVOT_WORK_TYPES.includes(work)) {
       agg.pivotCounts[work] += qtySafe;
@@ -572,20 +761,18 @@ export function groupAndAggregate(rows, col = {}, warn = []) {
       }
     }
 
-    const addr = getCell(cells, cm.address);
+    const addr = String(rec.address ?? '').trim();
     if (addr) {
       if (!agg.addressSample) agg.addressSample = addr;
       else if (addr !== agg.addressSample) agg.addressConflict = true;
     }
 
-    const areaNum = parseArea(getCell(cells, cm.area));
+    const areaNum = parseArea(rec.area);
     if (areaNum != null) agg.areaValues.push(areaNum);
 
-    const t1 = parseRuDate(getCell(cells, cm.date1));
-    const t2 = parseRuDate(getCell(cells, cm.date2));
-    agg.dateVals.push(t1, t2);
+    agg.dateVals.push(parseRuDate(rec.date1), parseRuDate(rec.date2));
 
-    const fmt = lastNonEmptyCell(cells);
+    const fmt = String(rec.format ?? '').trim();
     if (fmt) agg.formats.push(fmt);
   }
 
@@ -596,7 +783,7 @@ export function groupAndAggregate(rows, col = {}, warn = []) {
     if (agg.rccSeen.length > 1)
       warn.push(`Несколько заказов RCC для «${tt}»: ${agg.rccSeen.join(', ')}`);
 
-    const uniqueFmt = [...new Set(agg.formats)];
+    const uniqueFmt = [...new Set(agg.formats.filter(Boolean))];
     if (uniqueFmt.length > 1) warn.push(`Разные форматы ММ для «${tt}»: ${uniqueFmt.join(' | ')}`);
 
     const uniqueAreaNums = [...new Set(agg.areaValues)];
@@ -607,6 +794,17 @@ export function groupAndAggregate(rows, col = {}, warn = []) {
   });
 
   return map;
+}
+
+/**
+ * Совместимость: матрица → агрегация (автодетект формата).
+ * @param {string[][]} rows
+ * @param {Partial<typeof DEFAULT_COLUMN_MAP>} col
+ * @param {string[]} [warn]
+ */
+export function groupAndAggregate(rows, col = {}, warn = []) {
+  const { records } = normalizeMatrixToRecords(rows, { columns: col });
+  return groupAndAggregateRecords(records, warn);
 }
 
 /**
@@ -692,8 +890,8 @@ export function ttHasAttention(tt, warnings) {
 
 export function transformFromMatrix(parsedRows, opts = {}) {
   const warnings = opts.warnings ?? [];
-  const col = opts.columns ?? {};
-  const groupMap = groupAndAggregate(parsedRows, col, warnings);
+  const { kind, records } = normalizeMatrixToRecords(parsedRows, opts);
+  const groupMap = groupAndAggregateRecords(records, warnings);
   const outRows = buildOutputRows(groupMap, opts);
 
   const warningsByTtFlags = outRows.map((r) => ttHasAttention(String(r['Название ТТ']), warnings));
@@ -702,103 +900,77 @@ export function transformFromMatrix(parsedRows, opts = {}) {
     rows: outRows,
     warnings,
     warningsByTtFlags,
+    inputKind: kind,
+    sourceRecords: records.length,
   };
 }
 
-/* --- Контрольный пример для сверки с эталоном --- */
+/* --- Контрольный пример: фрагмент заказа Magnit --- */
 
-export const GOLDEN_INPUT = [
-  'Шатер\tRCC-000126879\tОперативный план KRS-000000187 от 12.05.2026 17:19:32\tПервичный монтаж дисплея покупателя\t2\tКраснодар, ул. Северная 391\t404,95\tПавлов Иван Сергеевич\t8-960-478-31-96\t08.06.2026\t11.06.2026\t\t\tРД Новый концепт 3.1',
-  'Шатер\tRCC-000126879\tОперативный план KRS-000000187 от 12.05.2026 17:19:32\tПервичный монтаж прайсчекера\t1\tКраснодар, ул. Северная 391\t404,95\tПавлов Иван Сергеевич\t8-960-478-31-96\t08.06.2026\t11.06.2026\t\t\tРД Новый концепт 3.1',
-  'Шатер\tRCC-000126879\tОперативный план KRS-000000187 от 12.05.2026 17:19:32\tПервичный монтаж ТВ панели\t2\tКраснодар, ул. Северная 391\t404,95\tПавлов Иван Сергеевич\t8-960-478-31-96\t08.06.2026\t11.06.2026\t\t\tРД Новый концепт 3.1',
-  'Айбаш\tRCC-000126882\tОперативный план GKC-000001156 от 15.05.2026 10:10:29\tПервичный монтаж прайсчекера\t1\tСаратовская область, Саратов, ул.Азина 19\t490,26\tМитрофанов Владимир Александрович\t8 906 319 06 43\t16.06.2026\t19.06.2026\t\t\tБО Новый концепт 3.1',
-  'Рушановская\tRCC-000126876\tОперативный план GKC-000001002 от 08.04.2026 13:39:17\tПервичный монтаж прайсчекера\t1\tРеспублика Коми, Сыктывкар, ул.Морозова 12\t377,91\tСельков Дмитрий Михайлович\t89042717367, 89617608373\t23.06.2026\t26.06.2026\t\t\tБО Новый концепт 3.1',
-  'Инкас\tRCC-000126877\tОперативный план VRN-000000193 от 23.04.2026 15:12:15\tПервичный монтаж дисплея покупателя\t2\t241047, Брянская обл, Брянск г, Тельмана ул, дом № 68, А\t581,47\tБарановский Владимир Владимирович\t8-960-560-43-63\t23.06.2026\t26.06.2026\t\t\tРД Новый концепт 3.1',
-  'Инкас\tRCC-000126877\tОперативный план VRN-000000193 от 23.04.2026 15:12:15\tПервичный монтаж прайсчекера\t1\t241047, Брянская обл, Брянск г, Тельмана ул, дом № 68, А\t581,47\tБарановский Владимир Владимирович\t8-960-560-43-63\t23.06.2026\t26.06.2026\t\t\tРД Новый концепт 3.1',
-  'Инкас\tRCC-000126877\tОперативный план VRN-000000193 от 23.04.2026 15:12:15\tПервичный монтаж ТВ панели\t2\t241047, Брянская обл, Брянск г, Тельмана ул, дом № 68, А\t581,47\tБарановский Владимир Владимирович\t8-960-560-43-63\t23.06.2026\t26.06.2026\t\t\tРД Новый концепт 3.1',
-  'Заметка\tRCC-000126878\tОперативный план OMC-000000190 от 12.05.2026 12:10:33\tПервичный монтаж прайсчекера\t1\tКемеровская область - Кузбасс, Юрга, ул.Победы 10\t0\tЧигряй Константин Николаевич\t89050756076\t23.06.2026\t26.06.2026\t\t\tБО Новый концепт 3.1',
-  'Бланк\tRCC-000126880\tОперативный план SPB-000000147 от 13.05.2026 10:19:11\tПервичный монтаж дисплея покупателя\t3\t183031, Мурманская обл, Мурманск г, Свердлова ул, дом № 8\t435,47\tСтепанов Андрей Валерьевич\t8921-041-42-43\t23.06.2026\t26.06.2026\t\t\tРД Новый концепт 3.1',
-  'Бланк\tRCC-000126880\tОперативный план SPB-000000147 от 13.05.2026 10:19:11\tПервичный монтаж прайсчекера\t1\t183031, Мурманская обл, Мурманск г, Свердлова ул, дом № 8\t435,47\tСтепанов Андрей Валерьевич\t8921-041-42-43\t23.06.2026\t26.06.2026\t\t\tРД Новый концепт 3.1',
-  'Бланк\tRCC-000126880\tОперативный план SPB-000000147 от 13.05.2026 10:19:11\tПервичный монтаж ТВ панели\t2\t183031, Мурманская обл, Мурманск г, Свердлова ул, дом № 8\t435,47\tСтепанов Андрей Валерьевич\t8921-041-42-43\t23.06.2026\t26.06.2026\t\t\tРД Новый концепт 3.1',
-  'Джентес\tRCC-000126881\tОперативный план GKC-000001150 от 13.05.2026 16:35:55\tПервичный монтаж дисплея покупателя\t2\t195299, Санкт-Петербург г, Муринская дор, дом № 53, стр. 1, нежилые помещения №14-Н, №15-Н\t399,2\tБалушкин Андрей Александрович\t. +79210769606\t23.06.2026\t26.06.2026\t\t\tРД Новый концепт 3.1',
-  'Джентес\tRCC-000126881\tОперативный план GKC-000001150 от 13.05.2026 16:35:55\tПервичный монтаж прайсчекера\t1\t195299, Санкт-Петербург г, Муринская дор, дом № 53, стр. 1, нежилые помещения №14-Н, №15-Н\t399,2\tБалушкин Андрей Александрович\t. +79210769606\t23.06.2026\t26.06.2026\t\t\tРД Новый концепт 3.1',
-  'Джентес\tRCC-000126881\tОперативный план GKC-000001150 от 13.05.2026 16:35:55\tПервичный монтаж ТВ панели\t2\t195299, Санкт-Петербург г, Муринская дор, дом № 53, стр. 1, нежилые помещения №14-Н, №15-Н\t399,2\tБалушкин Андрей Александрович\t. +79210769606\t23.06.2026\t26.06.2026\t\t\tРД Новый концепт 3.1',
-].join('\n');
+/** Матрица как после SheetJS: позиция + строка адреса. */
+export const GOLDEN_ZAKAZ_MATRIX = [
+  ['№ п/п', 'Номер заказа', 'Наименование', '', '', 'Модель', '', '', 'Кол-во, шт', '', '', '', 'Дата поставки', 'Дата окончания монтажа', 'Место поставки'],
+  ['1', 'RCC-000160293', 'Первичный монтаж ИТ-оборудования', '', '', 'Первичный монтаж громкоговорителя', '', '', '3', '', '', '', '08.12.2026', '08.12.2026', 'Роскошь'],
+  ['', '', '', '', '', '', '', '', '', '', '', '', '', '', 'Краснодарский край, Краснодар г'],
+  ['2', 'RCC-000160293', 'Первичный монтаж ИТ-оборудования', '', '', 'Первичный монтаж системы аудиовещания', '', '', '1', '', '', '', '08.12.2026', '08.12.2026', 'Роскошь'],
+  ['', '', '', '', '', '', '', '', '', '', '', '', '', '', 'Краснодарский край, Краснодар г'],
+  ['3', 'RCC-000160293', 'Первичный монтаж ИТ-оборудования', '', '', 'Первичный монтаж ТВ панели', '', '', '1', '', '', '', '08.12.2026', '08.12.2026', 'Роскошь'],
+  ['', '', '', '', '', '', '', '', '', '', '', '', '', '', 'Краснодарский край, Краснодар г'],
+  ['4', 'RCC-000160299', 'Первичный монтаж ИТ-оборудования', '', '', 'Первичный монтаж громкоговорителя', '', '', '7', '', '', '', '08.12.2026', '08.12.2026', 'Салки'],
+  ['', '', '', '', '', '', '', '', '', '', '', '', '', '', '105484, Москва г, Сиреневый б-р, дом № 60'],
+  ['5', 'RCC-000160299', 'Первичный монтаж ИТ-оборудования', '', '', 'Первичный монтаж дисплея покупателя', '', '', '2', '', '', '', '08.12.2026', '08.12.2026', 'Салки'],
+  ['', '', '', '', '', '', '', '', '', '', '', '', '', '', '105484, Москва г, Сиреневый б-р, дом № 60'],
+  ['6', 'RCC-000160299', 'Первичный монтаж ИТ-оборудования', '', '', 'Первичный монтаж прайсчекера', '', '', '1', '', '', '', '08.12.2026', '08.12.2026', 'Салки'],
+  ['', '', '', '', '', '', '', '', '', '', '', '', '', '', '105484, Москва г, Сиреневый б-р, дом № 60'],
+  ['7', 'RCC-000160299', 'Первичный монтаж ИТ-оборудования', '', '', 'Первичный монтаж системы аудиовещания', '', '', '1', '', '', '', '08.12.2026', '08.12.2026', 'Салки'],
+  ['', '', '', '', '', '', '', '', '', '', '', '', '', '', '105484, Москва г, Сиреневый б-р, дом № 60'],
+  ['8', 'RCC-000160299', 'Первичный монтаж ИТ-оборудования', '', '', 'Первичный монтаж ТВ панели', '', '', '2', '', '', '', '08.12.2026', '08.12.2026', 'Салки'],
+  ['', '', '', '', '', '', '', '', '', '', '', '', '', '', '105484, Москва г, Сиреневый б-р, дом № 60'],
+  ['9', 'RCC-000160300', 'Первичный монтаж ИТ-оборудования', '', '', 'Первичный монтаж прайсчекера', '', '', '1', '', '', '', '08.12.2026', '08.12.2026', 'Брудергауз, КПП 222545005'],
+  ['', '', '', '', '', '', '', '', '', '', '', '', '', '', '656049, Алтайский край, Барнаул г, Пролетарская ул, дом № 150, пом. Н1'],
+];
 
-/** Эталон (ключ — Название ТТ): как в задаче пользователя. */
+/** @deprecated используйте GOLDEN_ZAKAZ_MATRIX */
+export const GOLDEN_INPUT = GOLDEN_ZAKAZ_MATRIX.map((r) => r.join('\t')).join('\n');
+
+/** Эталон (ключ — Название ТТ). */
 export const GOLDEN_EXPECTED = {
-  Айбаш: {
-    Очередь: '56',
+  Роскошь: {
+    Очередь: '100',
     'Дата открытия из заказа': '',
-    Область: 'Саратовская обл.',
-    площадь: '490',
+    Область: 'Краснодарский край',
+    Адрес: 'Краснодарский край, Краснодар г',
+    'Дата открытия': '08.12.2026',
     'Первичный монтаж дисплея покупателя': 0,
-    'Первичный монтаж прайсчекера': 1,
-    'Первичный монтаж ТВ панели': 0,
-    format: 'БО Новый концепт 3.1',
-    'Дата открытия': '19.06.2026',
+    'Первичный монтаж прайсчекера': 0,
+    'Первичный монтаж громкоговорителя': 3,
+    'Первичный монтаж системы аудиовещания': 1,
+    'Первичный монтаж ТВ панели': 1,
+    Медиаплеер: 1,
+    площадь: '',
+    format: '',
   },
-  Бланк: {
-    Очередь: '56',
+  Салки: {
+    Очередь: '100',
     'Дата открытия из заказа': '',
-    Область: 'Мурманская обл.',
-    площадь: '435',
-    'Первичный монтаж дисплея покупателя': 3,
-    'Первичный монтаж прайсчекера': 1,
-    'Первичный монтаж ТВ панели': 2,
-    format: 'РД Новый концепт 3.1',
-    'Дата открытия': '26.06.2026',
-  },
-  Джентес: {
-    Очередь: '56',
-    'Дата открытия из заказа': '',
-    Область: 'Санкт-Петербург',
-    площадь: '399',
-    'Дата открытия': '26.06.2026',
-    format: 'РД Новый концепт 3.1',
+    Область: 'Москва',
+    'Дата открытия': '08.12.2026',
     'Первичный монтаж дисплея покупателя': 2,
     'Первичный монтаж прайсчекера': 1,
+    'Первичный монтаж громкоговорителя': 7,
+    'Первичный монтаж системы аудиовещания': 1,
     'Первичный монтаж ТВ панели': 2,
+    Медиаплеер: 1,
+    площадь: '',
+    format: '',
   },
-  Инкас: {
-    Очередь: '56',
-    'Дата открытия из заказа': '',
-    Область: 'Брянская обл.',
-    площадь: '581',
-    'Первичный монтаж дисплея покупателя': 2,
+  Брудергауз: {
+    Очередь: '100',
+    Область: 'Алтайский край',
+    'Дата открытия': '08.12.2026',
     'Первичный монтаж прайсчекера': 1,
-    'Первичный монтаж ТВ панели': 2,
-    format: 'РД Новый концепт 3.1',
-    'Дата открытия': '26.06.2026',
-  },
-  Заметка: {
-    Очередь: '56',
-    'Дата открытия из заказа': '',
-    Область: 'Кемеровская обл.',
-    площадь: '0',
-    'Дата открытия': '26.06.2026',
-    format: 'БО Новый концепт 3.1',
-    'Первичный монтаж прайсчекера': 1,
-  },
-  Рушановская: {
-    Очередь: '56',
-    'Дата открытия из заказа': '',
-    Область: 'Республика Коми',
-    площадь: '378',
-    'Дата открытия': '26.06.2026',
-    format: 'БО Новый концепт 3.1',
-    'Первичный монтаж прайсчекера': 1,
-  },
-  Шатер: {
-    Очередь: '56',
-    'Дата открытия из заказа': '',
-    Область: 'Краснодар',
-    площадь: '405',
-    'Первичный монтаж дисплея покупателя': 2,
-    'Первичный монтаж прайсчекера': 1,
-    'Первичный монтаж ТВ панели': 2,
-    'Дата открытия': '11.06.2026',
-    format: 'РД Новый концепт 3.1',
+    Медиаплеер: 0,
+    format: '',
   },
 };
 
@@ -806,9 +978,9 @@ export const GOLDEN_EXPECTED = {
  * Возвращает список несовпадений с эталоном (или пусто).
  */
 export function runGoldenSampleTest() {
-  const { rows } = executeTransform(GOLDEN_INPUT, {
-    queueDefault: '56',
-    skipFirstRow: false,
+  const { rows } = transformFromMatrix(GOLDEN_ZAKAZ_MATRIX, {
+    queueDefault: '100',
+    inputKind: 'zakaz',
   });
   /** @type {string[]} */
   const issues = [];

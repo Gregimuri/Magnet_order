@@ -50,6 +50,15 @@
     date1: 9,
     date2: 10
   };
+  var ZAKAZ_COLUMN_MAP = {
+    rowNo: 0,
+    orderRcc: 1,
+    workType: 5,
+    quantity: 8,
+    date1: 12,
+    date2: 13,
+    placeOrAddress: 14
+  };
   function detectDelimiter(sampleLine) {
     if (!sampleLine) return "	";
     const tabCount = (sampleLine.match(/\t/g) || []).length;
@@ -199,7 +208,7 @@
     const mosOblastPhrase = /(?:^|[\s,;])(Московская)\s+(?:область|обл\.?)(?=[$\s,;])/iu.exec(body);
     if (/^Краснодар\s*,/.test(body) || /(?:^|[\s,;])Краснодар\s*(?=,)/iu.test(body) || /(?:^|[\s,;])Краснодар,/iu.test(body))
       return "\u041A\u0440\u0430\u0441\u043D\u043E\u0434\u0430\u0440";
-    if (/\bгород\s+Москва\b/iu.test(body) || /(?:^|[\s,;])Москва\s*(?=,)/iu.test(body) && !mosOblastPhrase && !/\bМосковская\s+(?:область|обл)/iu.test(body))
+    if (/\bгород\s+Москва\b/iu.test(body) || /(?:^|[\s,;])Москва(?:\s*г\.?)?(?=[\s,;]|$)/iu.test(body) && !mosOblastPhrase && !/Московская\s+(?:область|обл)/iu.test(body))
       return "\u041C\u043E\u0441\u043A\u0432\u0430";
     if (mosOblastPhrase) return toskayaOblastAbbrev(mosOblastPhrase[1]);
     if (/Санкт-Петербург/iu.test(body)) return "\u0421\u0430\u043D\u043A\u0442-\u041F\u0435\u0442\u0435\u0440\u0431\u0443\u0440\u0433";
@@ -293,12 +302,118 @@
     if (!valid.length) return null;
     return Math.max(...valid);
   }
-  function groupAndAggregate(rows, col = {}, warn = []) {
+  function normalizeCells(cells) {
+    return (cells || []).map((c) => String(c ?? "").replace(/\u00A0/g, " ").trim());
+  }
+  function stripTtPlaceExtras(place) {
+    return String(place ?? "").replace(/\u00A0/g, " ").replace(/,\s*КПП\s*[\d\s]+$/iu, "").trim();
+  }
+  function detectInputKind(rows) {
+    const head = rows.slice(0, 50).map((r) => normalizeCells(r).join("	")).join("\n");
+    if (/на основании спецификации/i.test(head)) return "zakaz";
+    if (/№\s*п\s*\/\s*п/i.test(head) && /место поставки|номер заказа/i.test(head)) return "zakaz";
+    let zakazHits = 0;
+    let legacyHits = 0;
+    for (const raw of rows) {
+      const cells = normalizeCells(raw);
+      if (!cells.length) continue;
+      if (/^\d+$/.test(cells[0] || "") && /^RCC-/i.test(cells[1] || "")) zakazHits += 1;
+      if (cells[0] && cells[0] !== "\u0422\u0422" && /^RCC-/i.test(cells[1] || "") && !/^\d+$/.test(cells[0]))
+        legacyHits += 1;
+    }
+    if (zakazHits >= 2 && zakazHits >= legacyHits) return "zakaz";
+    return "legacy";
+  }
+  function extractZakazRecords(rows) {
+    const zm = ZAKAZ_COLUMN_MAP;
+    const out = [];
+    for (let i = 0; i < rows.length; i += 1) {
+      const cells = normalizeCells(rows[i]);
+      if (!/^\d+$/.test(cells[zm.rowNo] || "")) continue;
+      const rcc = cells[zm.orderRcc] || "";
+      if (!/^RCC-/i.test(rcc)) continue;
+      let workType = cells[zm.workType] || "";
+      if (!workType || /^модель$/i.test(workType)) {
+        workType = cells.find((c) => PIVOT_WORK_TYPES.includes(c)) || workType;
+      }
+      if (!workType || /^модель$/i.test(workType) || /^наименование$/i.test(workType)) continue;
+      const qtyRaw = String(cells[zm.quantity] ?? "").replace(/\s/g, "");
+      let quantity = parseInt(qtyRaw, 10);
+      if (!Number.isFinite(quantity)) {
+        quantity = 0;
+        const wi = cells.indexOf(workType);
+        if (wi >= 0) {
+          for (let j = wi + 1; j < cells.length; j += 1) {
+            const n = parseInt(String(cells[j]).replace(/\s/g, ""), 10);
+            if (Number.isFinite(n) && n > 0 && n < 1e5) {
+              quantity = n;
+              break;
+            }
+          }
+        }
+      }
+      const tt = stripTtPlaceExtras(cells[zm.placeOrAddress] || "");
+      if (!tt || /^адрес/i.test(tt) || /^место/i.test(tt)) continue;
+      let address = "";
+      if (i + 1 < rows.length) {
+        const next = normalizeCells(rows[i + 1]);
+        const nextIsData = /^\d+$/.test(next[zm.rowNo] || "") && /^RCC-/i.test(next[zm.orderRcc] || "");
+        const nextIsHeader = /^№\s*п/i.test(next[0] || "") || /^номер заказа$/i.test(String(next[1] || "").toLowerCase());
+        if (!nextIsData && !nextIsHeader) {
+          const cand = next[zm.placeOrAddress] || next.find((c, idx) => idx >= 12 && c && !/^адрес/i.test(c) && !/^место/i.test(c)) || "";
+          if (cand && cand !== tt && !/^за счет/i.test(cand) && !/^CNT-/i.test(cand) && !/^RCC-/i.test(cand)) {
+            address = cand;
+          }
+        }
+      }
+      out.push({
+        tt,
+        rcc,
+        workType,
+        quantity: Number.isFinite(quantity) ? quantity : 0,
+        address,
+        area: "",
+        date1: cells[zm.date1] || "",
+        date2: cells[zm.date2] || "",
+        format: ""
+      });
+    }
+    return out;
+  }
+  function extractLegacyRecords(rows, col = {}) {
     const cm = { ...DEFAULT_COLUMN_MAP, ...col };
-    const map = /* @__PURE__ */ new Map();
-    const getCell = (cells, idx) => typeof idx === "number" && idx >= 0 ? (cells[idx] ?? "").trim() : "";
-    for (const cells of rows) {
+    const out = [];
+    const getCell = (cells, idx) => typeof idx === "number" && idx >= 0 ? String(cells[idx] ?? "").trim() : "";
+    for (const raw of rows) {
+      const cells = normalizeCells(raw);
       const tt = getCell(cells, cm.ttName);
+      if (!tt || tt === "\u0422\u0422" || tt === "\u041D\u0430\u0437\u0432\u0430\u043D\u0438\u0435 \u0422\u0422") continue;
+      const workType = getCell(cells, cm.workType);
+      if (workType === "\u041C\u043E\u0434\u0435\u043B\u044C") continue;
+      const qty = parseInt(getCell(cells, cm.quantity), 10);
+      out.push({
+        tt,
+        rcc: getCell(cells, cm.orderRcc),
+        workType,
+        quantity: Number.isFinite(qty) ? qty : 0,
+        address: getCell(cells, cm.address),
+        area: getCell(cells, cm.area),
+        date1: getCell(cells, cm.date1),
+        date2: getCell(cells, cm.date2),
+        format: lastNonEmptyCell(cells)
+      });
+    }
+    return out;
+  }
+  function normalizeMatrixToRecords(rows, opts = {}) {
+    const kind = opts.inputKind && opts.inputKind !== "auto" ? opts.inputKind : detectInputKind(rows);
+    if (kind === "zakaz") return { kind, records: extractZakazRecords(rows) };
+    return { kind: "legacy", records: extractLegacyRecords(rows, opts.columns) };
+  }
+  function groupAndAggregateRecords(records, warn = []) {
+    const map = /* @__PURE__ */ new Map();
+    for (const rec of records) {
+      const tt = String(rec.tt ?? "").trim();
       if (!tt) continue;
       let agg = map.get(tt);
       if (!agg) {
@@ -315,12 +430,10 @@
         };
         map.set(tt, agg);
       }
-      const rcc = getCell(cells, cm.orderRcc);
+      const rcc = String(rec.rcc ?? "").trim();
       if (rcc && rcc !== "\u041A\u0410 \u043D\u0435 \u043C\u043E\u043D\u0442\u0438\u0440\u0443\u0435\u0442" && !agg.rccSeen.includes(rcc)) agg.rccSeen.push(rcc);
-      const work = getCell(cells, cm.workType);
-      const qtyRaw = getCell(cells, cm.quantity);
-      const qty = parseInt(qtyRaw, 10);
-      const qtySafe = Number.isFinite(qty) ? qty : 0;
+      const work = String(rec.workType ?? "").trim();
+      const qtySafe = Number.isFinite(rec.quantity) ? rec.quantity : 0;
       if (PIVOT_WORK_TYPES.includes(work)) {
         agg.pivotCounts[work] += qtySafe;
       } else if (work && !shouldIgnoreUnknownWorkWarning(work)) {
@@ -329,17 +442,15 @@
           warn.push(`\u041D\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043D\u044B\u0439 \u0442\u0438\u043F \u0440\u0430\u0431\u043E\u0442 \u0434\u043B\u044F \xAB${tt}\xBB: "${work}"`);
         }
       }
-      const addr = getCell(cells, cm.address);
+      const addr = String(rec.address ?? "").trim();
       if (addr) {
         if (!agg.addressSample) agg.addressSample = addr;
         else if (addr !== agg.addressSample) agg.addressConflict = true;
       }
-      const areaNum = parseArea(getCell(cells, cm.area));
+      const areaNum = parseArea(rec.area);
       if (areaNum != null) agg.areaValues.push(areaNum);
-      const t1 = parseRuDate(getCell(cells, cm.date1));
-      const t2 = parseRuDate(getCell(cells, cm.date2));
-      agg.dateVals.push(t1, t2);
-      const fmt = lastNonEmptyCell(cells);
+      agg.dateVals.push(parseRuDate(rec.date1), parseRuDate(rec.date2));
+      const fmt = String(rec.format ?? "").trim();
       if (fmt) agg.formats.push(fmt);
     }
     map.forEach((agg, tt) => {
@@ -347,7 +458,7 @@
         warn.push(`\u0420\u0430\u0437\u043D\u044B\u0439 \u0430\u0434\u0440\u0435\u0441 \u0432\u043D\u0443\u0442\u0440\u0438 \u0433\u0440\u0443\u043F\u043F\u044B \xAB${tt}\xBB \u2014 \u0432 \u0440\u0435\u0437\u0443\u043B\u044C\u0442\u0430\u0442\u0435 \u0443\u043A\u0430\u0437\u0430\u043D \u043F\u0435\u0440\u0432\u044B\u0439 \u0432\u0441\u0442\u0440\u0435\u0442\u0438\u0432\u0448\u0438\u0439\u0441\u044F`);
       if (agg.rccSeen.length > 1)
         warn.push(`\u041D\u0435\u0441\u043A\u043E\u043B\u044C\u043A\u043E \u0437\u0430\u043A\u0430\u0437\u043E\u0432 RCC \u0434\u043B\u044F \xAB${tt}\xBB: ${agg.rccSeen.join(", ")}`);
-      const uniqueFmt = [...new Set(agg.formats)];
+      const uniqueFmt = [...new Set(agg.formats.filter(Boolean))];
       if (uniqueFmt.length > 1) warn.push(`\u0420\u0430\u0437\u043D\u044B\u0435 \u0444\u043E\u0440\u043C\u0430\u0442\u044B \u041C\u041C \u0434\u043B\u044F \xAB${tt}\xBB: ${uniqueFmt.join(" | ")}`);
       const uniqueAreaNums = [...new Set(agg.areaValues)];
       if (uniqueAreaNums.length > 1)
@@ -411,33 +522,40 @@
   }
   function transformFromMatrix(parsedRows, opts = {}) {
     const warnings = opts.warnings ?? [];
-    const col = opts.columns ?? {};
-    const groupMap = groupAndAggregate(parsedRows, col, warnings);
+    const { kind, records } = normalizeMatrixToRecords(parsedRows, opts);
+    const groupMap = groupAndAggregateRecords(records, warnings);
     const outRows = buildOutputRows(groupMap, opts);
     const warningsByTtFlags = outRows.map((r) => ttHasAttention(String(r["\u041D\u0430\u0437\u0432\u0430\u043D\u0438\u0435 \u0422\u0422"]), warnings));
     return {
       rows: outRows,
       warnings,
-      warningsByTtFlags
+      warningsByTtFlags,
+      inputKind: kind,
+      sourceRecords: records.length
     };
   }
-  var GOLDEN_INPUT = [
-    "\u0428\u0430\u0442\u0435\u0440	RCC-000126879	\u041E\u043F\u0435\u0440\u0430\u0442\u0438\u0432\u043D\u044B\u0439 \u043F\u043B\u0430\u043D KRS-000000187 \u043E\u0442 12.05.2026 17:19:32	\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0434\u0438\u0441\u043F\u043B\u0435\u044F \u043F\u043E\u043A\u0443\u043F\u0430\u0442\u0435\u043B\u044F	2	\u041A\u0440\u0430\u0441\u043D\u043E\u0434\u0430\u0440, \u0443\u043B. \u0421\u0435\u0432\u0435\u0440\u043D\u0430\u044F 391	404,95	\u041F\u0430\u0432\u043B\u043E\u0432 \u0418\u0432\u0430\u043D \u0421\u0435\u0440\u0433\u0435\u0435\u0432\u0438\u0447	8-960-478-31-96	08.06.2026	11.06.2026			\u0420\u0414 \u041D\u043E\u0432\u044B\u0439 \u043A\u043E\u043D\u0446\u0435\u043F\u0442 3.1",
-    "\u0428\u0430\u0442\u0435\u0440	RCC-000126879	\u041E\u043F\u0435\u0440\u0430\u0442\u0438\u0432\u043D\u044B\u0439 \u043F\u043B\u0430\u043D KRS-000000187 \u043E\u0442 12.05.2026 17:19:32	\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u043F\u0440\u0430\u0439\u0441\u0447\u0435\u043A\u0435\u0440\u0430	1	\u041A\u0440\u0430\u0441\u043D\u043E\u0434\u0430\u0440, \u0443\u043B. \u0421\u0435\u0432\u0435\u0440\u043D\u0430\u044F 391	404,95	\u041F\u0430\u0432\u043B\u043E\u0432 \u0418\u0432\u0430\u043D \u0421\u0435\u0440\u0433\u0435\u0435\u0432\u0438\u0447	8-960-478-31-96	08.06.2026	11.06.2026			\u0420\u0414 \u041D\u043E\u0432\u044B\u0439 \u043A\u043E\u043D\u0446\u0435\u043F\u0442 3.1",
-    "\u0428\u0430\u0442\u0435\u0440	RCC-000126879	\u041E\u043F\u0435\u0440\u0430\u0442\u0438\u0432\u043D\u044B\u0439 \u043F\u043B\u0430\u043D KRS-000000187 \u043E\u0442 12.05.2026 17:19:32	\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0422\u0412 \u043F\u0430\u043D\u0435\u043B\u0438	2	\u041A\u0440\u0430\u0441\u043D\u043E\u0434\u0430\u0440, \u0443\u043B. \u0421\u0435\u0432\u0435\u0440\u043D\u0430\u044F 391	404,95	\u041F\u0430\u0432\u043B\u043E\u0432 \u0418\u0432\u0430\u043D \u0421\u0435\u0440\u0433\u0435\u0435\u0432\u0438\u0447	8-960-478-31-96	08.06.2026	11.06.2026			\u0420\u0414 \u041D\u043E\u0432\u044B\u0439 \u043A\u043E\u043D\u0446\u0435\u043F\u0442 3.1",
-    "\u0410\u0439\u0431\u0430\u0448	RCC-000126882	\u041E\u043F\u0435\u0440\u0430\u0442\u0438\u0432\u043D\u044B\u0439 \u043F\u043B\u0430\u043D GKC-000001156 \u043E\u0442 15.05.2026 10:10:29	\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u043F\u0440\u0430\u0439\u0441\u0447\u0435\u043A\u0435\u0440\u0430	1	\u0421\u0430\u0440\u0430\u0442\u043E\u0432\u0441\u043A\u0430\u044F \u043E\u0431\u043B\u0430\u0441\u0442\u044C, \u0421\u0430\u0440\u0430\u0442\u043E\u0432, \u0443\u043B.\u0410\u0437\u0438\u043D\u0430 19	490,26	\u041C\u0438\u0442\u0440\u043E\u0444\u0430\u043D\u043E\u0432 \u0412\u043B\u0430\u0434\u0438\u043C\u0438\u0440 \u0410\u043B\u0435\u043A\u0441\u0430\u043D\u0434\u0440\u043E\u0432\u0438\u0447	8 906 319 06 43	16.06.2026	19.06.2026			\u0411\u041E \u041D\u043E\u0432\u044B\u0439 \u043A\u043E\u043D\u0446\u0435\u043F\u0442 3.1",
-    "\u0420\u0443\u0448\u0430\u043D\u043E\u0432\u0441\u043A\u0430\u044F	RCC-000126876	\u041E\u043F\u0435\u0440\u0430\u0442\u0438\u0432\u043D\u044B\u0439 \u043F\u043B\u0430\u043D GKC-000001002 \u043E\u0442 08.04.2026 13:39:17	\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u043F\u0440\u0430\u0439\u0441\u0447\u0435\u043A\u0435\u0440\u0430	1	\u0420\u0435\u0441\u043F\u0443\u0431\u043B\u0438\u043A\u0430 \u041A\u043E\u043C\u0438, \u0421\u044B\u043A\u0442\u044B\u0432\u043A\u0430\u0440, \u0443\u043B.\u041C\u043E\u0440\u043E\u0437\u043E\u0432\u0430 12	377,91	\u0421\u0435\u043B\u044C\u043A\u043E\u0432 \u0414\u043C\u0438\u0442\u0440\u0438\u0439 \u041C\u0438\u0445\u0430\u0439\u043B\u043E\u0432\u0438\u0447	89042717367, 89617608373	23.06.2026	26.06.2026			\u0411\u041E \u041D\u043E\u0432\u044B\u0439 \u043A\u043E\u043D\u0446\u0435\u043F\u0442 3.1",
-    "\u0418\u043D\u043A\u0430\u0441	RCC-000126877	\u041E\u043F\u0435\u0440\u0430\u0442\u0438\u0432\u043D\u044B\u0439 \u043F\u043B\u0430\u043D VRN-000000193 \u043E\u0442 23.04.2026 15:12:15	\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0434\u0438\u0441\u043F\u043B\u0435\u044F \u043F\u043E\u043A\u0443\u043F\u0430\u0442\u0435\u043B\u044F	2	241047, \u0411\u0440\u044F\u043D\u0441\u043A\u0430\u044F \u043E\u0431\u043B, \u0411\u0440\u044F\u043D\u0441\u043A \u0433, \u0422\u0435\u043B\u044C\u043C\u0430\u043D\u0430 \u0443\u043B, \u0434\u043E\u043C \u2116 68, \u0410	581,47	\u0411\u0430\u0440\u0430\u043D\u043E\u0432\u0441\u043A\u0438\u0439 \u0412\u043B\u0430\u0434\u0438\u043C\u0438\u0440 \u0412\u043B\u0430\u0434\u0438\u043C\u0438\u0440\u043E\u0432\u0438\u0447	8-960-560-43-63	23.06.2026	26.06.2026			\u0420\u0414 \u041D\u043E\u0432\u044B\u0439 \u043A\u043E\u043D\u0446\u0435\u043F\u0442 3.1",
-    "\u0418\u043D\u043A\u0430\u0441	RCC-000126877	\u041E\u043F\u0435\u0440\u0430\u0442\u0438\u0432\u043D\u044B\u0439 \u043F\u043B\u0430\u043D VRN-000000193 \u043E\u0442 23.04.2026 15:12:15	\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u043F\u0440\u0430\u0439\u0441\u0447\u0435\u043A\u0435\u0440\u0430	1	241047, \u0411\u0440\u044F\u043D\u0441\u043A\u0430\u044F \u043E\u0431\u043B, \u0411\u0440\u044F\u043D\u0441\u043A \u0433, \u0422\u0435\u043B\u044C\u043C\u0430\u043D\u0430 \u0443\u043B, \u0434\u043E\u043C \u2116 68, \u0410	581,47	\u0411\u0430\u0440\u0430\u043D\u043E\u0432\u0441\u043A\u0438\u0439 \u0412\u043B\u0430\u0434\u0438\u043C\u0438\u0440 \u0412\u043B\u0430\u0434\u0438\u043C\u0438\u0440\u043E\u0432\u0438\u0447	8-960-560-43-63	23.06.2026	26.06.2026			\u0420\u0414 \u041D\u043E\u0432\u044B\u0439 \u043A\u043E\u043D\u0446\u0435\u043F\u0442 3.1",
-    "\u0418\u043D\u043A\u0430\u0441	RCC-000126877	\u041E\u043F\u0435\u0440\u0430\u0442\u0438\u0432\u043D\u044B\u0439 \u043F\u043B\u0430\u043D VRN-000000193 \u043E\u0442 23.04.2026 15:12:15	\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0422\u0412 \u043F\u0430\u043D\u0435\u043B\u0438	2	241047, \u0411\u0440\u044F\u043D\u0441\u043A\u0430\u044F \u043E\u0431\u043B, \u0411\u0440\u044F\u043D\u0441\u043A \u0433, \u0422\u0435\u043B\u044C\u043C\u0430\u043D\u0430 \u0443\u043B, \u0434\u043E\u043C \u2116 68, \u0410	581,47	\u0411\u0430\u0440\u0430\u043D\u043E\u0432\u0441\u043A\u0438\u0439 \u0412\u043B\u0430\u0434\u0438\u043C\u0438\u0440 \u0412\u043B\u0430\u0434\u0438\u043C\u0438\u0440\u043E\u0432\u0438\u0447	8-960-560-43-63	23.06.2026	26.06.2026			\u0420\u0414 \u041D\u043E\u0432\u044B\u0439 \u043A\u043E\u043D\u0446\u0435\u043F\u0442 3.1",
-    "\u0417\u0430\u043C\u0435\u0442\u043A\u0430	RCC-000126878	\u041E\u043F\u0435\u0440\u0430\u0442\u0438\u0432\u043D\u044B\u0439 \u043F\u043B\u0430\u043D OMC-000000190 \u043E\u0442 12.05.2026 12:10:33	\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u043F\u0440\u0430\u0439\u0441\u0447\u0435\u043A\u0435\u0440\u0430	1	\u041A\u0435\u043C\u0435\u0440\u043E\u0432\u0441\u043A\u0430\u044F \u043E\u0431\u043B\u0430\u0441\u0442\u044C - \u041A\u0443\u0437\u0431\u0430\u0441\u0441, \u042E\u0440\u0433\u0430, \u0443\u043B.\u041F\u043E\u0431\u0435\u0434\u044B 10	0	\u0427\u0438\u0433\u0440\u044F\u0439 \u041A\u043E\u043D\u0441\u0442\u0430\u043D\u0442\u0438\u043D \u041D\u0438\u043A\u043E\u043B\u0430\u0435\u0432\u0438\u0447	89050756076	23.06.2026	26.06.2026			\u0411\u041E \u041D\u043E\u0432\u044B\u0439 \u043A\u043E\u043D\u0446\u0435\u043F\u0442 3.1",
-    "\u0411\u043B\u0430\u043D\u043A	RCC-000126880	\u041E\u043F\u0435\u0440\u0430\u0442\u0438\u0432\u043D\u044B\u0439 \u043F\u043B\u0430\u043D SPB-000000147 \u043E\u0442 13.05.2026 10:19:11	\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0434\u0438\u0441\u043F\u043B\u0435\u044F \u043F\u043E\u043A\u0443\u043F\u0430\u0442\u0435\u043B\u044F	3	183031, \u041C\u0443\u0440\u043C\u0430\u043D\u0441\u043A\u0430\u044F \u043E\u0431\u043B, \u041C\u0443\u0440\u043C\u0430\u043D\u0441\u043A \u0433, \u0421\u0432\u0435\u0440\u0434\u043B\u043E\u0432\u0430 \u0443\u043B, \u0434\u043E\u043C \u2116 8	435,47	\u0421\u0442\u0435\u043F\u0430\u043D\u043E\u0432 \u0410\u043D\u0434\u0440\u0435\u0439 \u0412\u0430\u043B\u0435\u0440\u044C\u0435\u0432\u0438\u0447	8921-041-42-43	23.06.2026	26.06.2026			\u0420\u0414 \u041D\u043E\u0432\u044B\u0439 \u043A\u043E\u043D\u0446\u0435\u043F\u0442 3.1",
-    "\u0411\u043B\u0430\u043D\u043A	RCC-000126880	\u041E\u043F\u0435\u0440\u0430\u0442\u0438\u0432\u043D\u044B\u0439 \u043F\u043B\u0430\u043D SPB-000000147 \u043E\u0442 13.05.2026 10:19:11	\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u043F\u0440\u0430\u0439\u0441\u0447\u0435\u043A\u0435\u0440\u0430	1	183031, \u041C\u0443\u0440\u043C\u0430\u043D\u0441\u043A\u0430\u044F \u043E\u0431\u043B, \u041C\u0443\u0440\u043C\u0430\u043D\u0441\u043A \u0433, \u0421\u0432\u0435\u0440\u0434\u043B\u043E\u0432\u0430 \u0443\u043B, \u0434\u043E\u043C \u2116 8	435,47	\u0421\u0442\u0435\u043F\u0430\u043D\u043E\u0432 \u0410\u043D\u0434\u0440\u0435\u0439 \u0412\u0430\u043B\u0435\u0440\u044C\u0435\u0432\u0438\u0447	8921-041-42-43	23.06.2026	26.06.2026			\u0420\u0414 \u041D\u043E\u0432\u044B\u0439 \u043A\u043E\u043D\u0446\u0435\u043F\u0442 3.1",
-    "\u0411\u043B\u0430\u043D\u043A	RCC-000126880	\u041E\u043F\u0435\u0440\u0430\u0442\u0438\u0432\u043D\u044B\u0439 \u043F\u043B\u0430\u043D SPB-000000147 \u043E\u0442 13.05.2026 10:19:11	\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0422\u0412 \u043F\u0430\u043D\u0435\u043B\u0438	2	183031, \u041C\u0443\u0440\u043C\u0430\u043D\u0441\u043A\u0430\u044F \u043E\u0431\u043B, \u041C\u0443\u0440\u043C\u0430\u043D\u0441\u043A \u0433, \u0421\u0432\u0435\u0440\u0434\u043B\u043E\u0432\u0430 \u0443\u043B, \u0434\u043E\u043C \u2116 8	435,47	\u0421\u0442\u0435\u043F\u0430\u043D\u043E\u0432 \u0410\u043D\u0434\u0440\u0435\u0439 \u0412\u0430\u043B\u0435\u0440\u044C\u0435\u0432\u0438\u0447	8921-041-42-43	23.06.2026	26.06.2026			\u0420\u0414 \u041D\u043E\u0432\u044B\u0439 \u043A\u043E\u043D\u0446\u0435\u043F\u0442 3.1",
-    "\u0414\u0436\u0435\u043D\u0442\u0435\u0441	RCC-000126881	\u041E\u043F\u0435\u0440\u0430\u0442\u0438\u0432\u043D\u044B\u0439 \u043F\u043B\u0430\u043D GKC-000001150 \u043E\u0442 13.05.2026 16:35:55	\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0434\u0438\u0441\u043F\u043B\u0435\u044F \u043F\u043E\u043A\u0443\u043F\u0430\u0442\u0435\u043B\u044F	2	195299, \u0421\u0430\u043D\u043A\u0442-\u041F\u0435\u0442\u0435\u0440\u0431\u0443\u0440\u0433 \u0433, \u041C\u0443\u0440\u0438\u043D\u0441\u043A\u0430\u044F \u0434\u043E\u0440, \u0434\u043E\u043C \u2116 53, \u0441\u0442\u0440. 1, \u043D\u0435\u0436\u0438\u043B\u044B\u0435 \u043F\u043E\u043C\u0435\u0449\u0435\u043D\u0438\u044F \u211614-\u041D, \u211615-\u041D	399,2	\u0411\u0430\u043B\u0443\u0448\u043A\u0438\u043D \u0410\u043D\u0434\u0440\u0435\u0439 \u0410\u043B\u0435\u043A\u0441\u0430\u043D\u0434\u0440\u043E\u0432\u0438\u0447	. +79210769606	23.06.2026	26.06.2026			\u0420\u0414 \u041D\u043E\u0432\u044B\u0439 \u043A\u043E\u043D\u0446\u0435\u043F\u0442 3.1",
-    "\u0414\u0436\u0435\u043D\u0442\u0435\u0441	RCC-000126881	\u041E\u043F\u0435\u0440\u0430\u0442\u0438\u0432\u043D\u044B\u0439 \u043F\u043B\u0430\u043D GKC-000001150 \u043E\u0442 13.05.2026 16:35:55	\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u043F\u0440\u0430\u0439\u0441\u0447\u0435\u043A\u0435\u0440\u0430	1	195299, \u0421\u0430\u043D\u043A\u0442-\u041F\u0435\u0442\u0435\u0440\u0431\u0443\u0440\u0433 \u0433, \u041C\u0443\u0440\u0438\u043D\u0441\u043A\u0430\u044F \u0434\u043E\u0440, \u0434\u043E\u043C \u2116 53, \u0441\u0442\u0440. 1, \u043D\u0435\u0436\u0438\u043B\u044B\u0435 \u043F\u043E\u043C\u0435\u0449\u0435\u043D\u0438\u044F \u211614-\u041D, \u211615-\u041D	399,2	\u0411\u0430\u043B\u0443\u0448\u043A\u0438\u043D \u0410\u043D\u0434\u0440\u0435\u0439 \u0410\u043B\u0435\u043A\u0441\u0430\u043D\u0434\u0440\u043E\u0432\u0438\u0447	. +79210769606	23.06.2026	26.06.2026			\u0420\u0414 \u041D\u043E\u0432\u044B\u0439 \u043A\u043E\u043D\u0446\u0435\u043F\u0442 3.1",
-    "\u0414\u0436\u0435\u043D\u0442\u0435\u0441	RCC-000126881	\u041E\u043F\u0435\u0440\u0430\u0442\u0438\u0432\u043D\u044B\u0439 \u043F\u043B\u0430\u043D GKC-000001150 \u043E\u0442 13.05.2026 16:35:55	\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0422\u0412 \u043F\u0430\u043D\u0435\u043B\u0438	2	195299, \u0421\u0430\u043D\u043A\u0442-\u041F\u0435\u0442\u0435\u0440\u0431\u0443\u0440\u0433 \u0433, \u041C\u0443\u0440\u0438\u043D\u0441\u043A\u0430\u044F \u0434\u043E\u0440, \u0434\u043E\u043C \u2116 53, \u0441\u0442\u0440. 1, \u043D\u0435\u0436\u0438\u043B\u044B\u0435 \u043F\u043E\u043C\u0435\u0449\u0435\u043D\u0438\u044F \u211614-\u041D, \u211615-\u041D	399,2	\u0411\u0430\u043B\u0443\u0448\u043A\u0438\u043D \u0410\u043D\u0434\u0440\u0435\u0439 \u0410\u043B\u0435\u043A\u0441\u0430\u043D\u0434\u0440\u043E\u0432\u0438\u0447	. +79210769606	23.06.2026	26.06.2026			\u0420\u0414 \u041D\u043E\u0432\u044B\u0439 \u043A\u043E\u043D\u0446\u0435\u043F\u0442 3.1"
-  ].join("\n");
+  var GOLDEN_ZAKAZ_MATRIX = [
+    ["\u2116 \u043F/\u043F", "\u041D\u043E\u043C\u0435\u0440 \u0437\u0430\u043A\u0430\u0437\u0430", "\u041D\u0430\u0438\u043C\u0435\u043D\u043E\u0432\u0430\u043D\u0438\u0435", "", "", "\u041C\u043E\u0434\u0435\u043B\u044C", "", "", "\u041A\u043E\u043B-\u0432\u043E, \u0448\u0442", "", "", "", "\u0414\u0430\u0442\u0430 \u043F\u043E\u0441\u0442\u0430\u0432\u043A\u0438", "\u0414\u0430\u0442\u0430 \u043E\u043A\u043E\u043D\u0447\u0430\u043D\u0438\u044F \u043C\u043E\u043D\u0442\u0430\u0436\u0430", "\u041C\u0435\u0441\u0442\u043E \u043F\u043E\u0441\u0442\u0430\u0432\u043A\u0438"],
+    ["1", "RCC-000160293", "\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0418\u0422-\u043E\u0431\u043E\u0440\u0443\u0434\u043E\u0432\u0430\u043D\u0438\u044F", "", "", "\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0433\u0440\u043E\u043C\u043A\u043E\u0433\u043E\u0432\u043E\u0440\u0438\u0442\u0435\u043B\u044F", "", "", "3", "", "", "", "08.12.2026", "08.12.2026", "\u0420\u043E\u0441\u043A\u043E\u0448\u044C"],
+    ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "\u041A\u0440\u0430\u0441\u043D\u043E\u0434\u0430\u0440\u0441\u043A\u0438\u0439 \u043A\u0440\u0430\u0439, \u041A\u0440\u0430\u0441\u043D\u043E\u0434\u0430\u0440 \u0433"],
+    ["2", "RCC-000160293", "\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0418\u0422-\u043E\u0431\u043E\u0440\u0443\u0434\u043E\u0432\u0430\u043D\u0438\u044F", "", "", "\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0441\u0438\u0441\u0442\u0435\u043C\u044B \u0430\u0443\u0434\u0438\u043E\u0432\u0435\u0449\u0430\u043D\u0438\u044F", "", "", "1", "", "", "", "08.12.2026", "08.12.2026", "\u0420\u043E\u0441\u043A\u043E\u0448\u044C"],
+    ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "\u041A\u0440\u0430\u0441\u043D\u043E\u0434\u0430\u0440\u0441\u043A\u0438\u0439 \u043A\u0440\u0430\u0439, \u041A\u0440\u0430\u0441\u043D\u043E\u0434\u0430\u0440 \u0433"],
+    ["3", "RCC-000160293", "\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0418\u0422-\u043E\u0431\u043E\u0440\u0443\u0434\u043E\u0432\u0430\u043D\u0438\u044F", "", "", "\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0422\u0412 \u043F\u0430\u043D\u0435\u043B\u0438", "", "", "1", "", "", "", "08.12.2026", "08.12.2026", "\u0420\u043E\u0441\u043A\u043E\u0448\u044C"],
+    ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "\u041A\u0440\u0430\u0441\u043D\u043E\u0434\u0430\u0440\u0441\u043A\u0438\u0439 \u043A\u0440\u0430\u0439, \u041A\u0440\u0430\u0441\u043D\u043E\u0434\u0430\u0440 \u0433"],
+    ["4", "RCC-000160299", "\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0418\u0422-\u043E\u0431\u043E\u0440\u0443\u0434\u043E\u0432\u0430\u043D\u0438\u044F", "", "", "\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0433\u0440\u043E\u043C\u043A\u043E\u0433\u043E\u0432\u043E\u0440\u0438\u0442\u0435\u043B\u044F", "", "", "7", "", "", "", "08.12.2026", "08.12.2026", "\u0421\u0430\u043B\u043A\u0438"],
+    ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "105484, \u041C\u043E\u0441\u043A\u0432\u0430 \u0433, \u0421\u0438\u0440\u0435\u043D\u0435\u0432\u044B\u0439 \u0431-\u0440, \u0434\u043E\u043C \u2116 60"],
+    ["5", "RCC-000160299", "\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0418\u0422-\u043E\u0431\u043E\u0440\u0443\u0434\u043E\u0432\u0430\u043D\u0438\u044F", "", "", "\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0434\u0438\u0441\u043F\u043B\u0435\u044F \u043F\u043E\u043A\u0443\u043F\u0430\u0442\u0435\u043B\u044F", "", "", "2", "", "", "", "08.12.2026", "08.12.2026", "\u0421\u0430\u043B\u043A\u0438"],
+    ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "105484, \u041C\u043E\u0441\u043A\u0432\u0430 \u0433, \u0421\u0438\u0440\u0435\u043D\u0435\u0432\u044B\u0439 \u0431-\u0440, \u0434\u043E\u043C \u2116 60"],
+    ["6", "RCC-000160299", "\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0418\u0422-\u043E\u0431\u043E\u0440\u0443\u0434\u043E\u0432\u0430\u043D\u0438\u044F", "", "", "\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u043F\u0440\u0430\u0439\u0441\u0447\u0435\u043A\u0435\u0440\u0430", "", "", "1", "", "", "", "08.12.2026", "08.12.2026", "\u0421\u0430\u043B\u043A\u0438"],
+    ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "105484, \u041C\u043E\u0441\u043A\u0432\u0430 \u0433, \u0421\u0438\u0440\u0435\u043D\u0435\u0432\u044B\u0439 \u0431-\u0440, \u0434\u043E\u043C \u2116 60"],
+    ["7", "RCC-000160299", "\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0418\u0422-\u043E\u0431\u043E\u0440\u0443\u0434\u043E\u0432\u0430\u043D\u0438\u044F", "", "", "\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0441\u0438\u0441\u0442\u0435\u043C\u044B \u0430\u0443\u0434\u0438\u043E\u0432\u0435\u0449\u0430\u043D\u0438\u044F", "", "", "1", "", "", "", "08.12.2026", "08.12.2026", "\u0421\u0430\u043B\u043A\u0438"],
+    ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "105484, \u041C\u043E\u0441\u043A\u0432\u0430 \u0433, \u0421\u0438\u0440\u0435\u043D\u0435\u0432\u044B\u0439 \u0431-\u0440, \u0434\u043E\u043C \u2116 60"],
+    ["8", "RCC-000160299", "\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0418\u0422-\u043E\u0431\u043E\u0440\u0443\u0434\u043E\u0432\u0430\u043D\u0438\u044F", "", "", "\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0422\u0412 \u043F\u0430\u043D\u0435\u043B\u0438", "", "", "2", "", "", "", "08.12.2026", "08.12.2026", "\u0421\u0430\u043B\u043A\u0438"],
+    ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "105484, \u041C\u043E\u0441\u043A\u0432\u0430 \u0433, \u0421\u0438\u0440\u0435\u043D\u0435\u0432\u044B\u0439 \u0431-\u0440, \u0434\u043E\u043C \u2116 60"],
+    ["9", "RCC-000160300", "\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u0418\u0422-\u043E\u0431\u043E\u0440\u0443\u0434\u043E\u0432\u0430\u043D\u0438\u044F", "", "", "\u041F\u0435\u0440\u0432\u0438\u0447\u043D\u044B\u0439 \u043C\u043E\u043D\u0442\u0430\u0436 \u043F\u0440\u0430\u0439\u0441\u0447\u0435\u043A\u0435\u0440\u0430", "", "", "1", "", "", "", "08.12.2026", "08.12.2026", "\u0411\u0440\u0443\u0434\u0435\u0440\u0433\u0430\u0443\u0437, \u041A\u041F\u041F 222545005"],
+    ["", "", "", "", "", "", "", "", "", "", "", "", "", "", "656049, \u0410\u043B\u0442\u0430\u0439\u0441\u043A\u0438\u0439 \u043A\u0440\u0430\u0439, \u0411\u0430\u0440\u043D\u0430\u0443\u043B \u0433, \u041F\u0440\u043E\u043B\u0435\u0442\u0430\u0440\u0441\u043A\u0430\u044F \u0443\u043B, \u0434\u043E\u043C \u2116 150, \u043F\u043E\u043C. \u041D1"]
+  ];
+  var GOLDEN_INPUT = GOLDEN_ZAKAZ_MATRIX.map((r) => r.join("	")).join("\n");
 
   // app.js
   var $ = (id) => {
@@ -483,15 +601,19 @@
       }
       const queueVal = $("queue-input").value.trim();
       const warns = [];
-      const { rows, warnings, warningsByTtFlags } = transformFromMatrix(matrix, {
-        queueDefault: queueVal,
-        columns: PARSE_OPTS_BASE.columns,
-        warnings: warns
-      });
+      const { rows, warnings, warningsByTtFlags, inputKind, sourceRecords } = transformFromMatrix(
+        matrix,
+        {
+          queueDefault: queueVal,
+          columns: PARSE_OPTS_BASE.columns,
+          warnings: warns
+        }
+      );
       lastResult = rows;
       lastWarnings = warnings;
       lastWarnFlags = warningsByTtFlags;
-      $("meta-line").textContent = `\u0413\u043E\u0442\u043E\u0432\u043E: \u0441\u0442\u0440\u043E\u043A \u0438\u0441\u0445\u043E\u0434\u043D\u0438\u043A\u0430 ${matrix.length}, \u0442\u043E\u0440\u0433\u043E\u0432\u044B\u0445 \u0442\u043E\u0447\u0435\u043A ${rows.length}.`;
+      const kindLabel = inputKind === "zakaz" ? "\u0437\u0430\u043A\u0430\u0437 Magnit" : "\u043F\u043B\u043E\u0441\u043A\u0430\u044F \u0432\u044B\u0433\u0440\u0443\u0437\u043A\u0430";
+      $("meta-line").textContent = `\u0413\u043E\u0442\u043E\u0432\u043E (${kindLabel}): \u043F\u043E\u0437\u0438\u0446\u0438\u0439 ${sourceRecords ?? "\u2014"}, \u0442\u043E\u0440\u0433\u043E\u0432\u044B\u0445 \u0442\u043E\u0447\u0435\u043A ${rows.length}.`;
       renderWarnings(lastWarnings);
       $("warnings-block").hidden = warnings.length === 0;
       renderTable();
