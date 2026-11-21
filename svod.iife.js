@@ -168,6 +168,51 @@
     if (dt.getFullYear() !== yy || dt.getMonth() !== mo - 1 || dt.getDate() !== dd) return null;
     return dt.getTime();
   }
+  function parseFlexibleDate(raw) {
+    if (raw == null || raw === "") return null;
+    const ru = parseRuDate(String(raw));
+    if (ru != null) return ru;
+    const n = Number(String(raw).trim().replace(",", "."));
+    if (!Number.isFinite(n) || n < 3e4 || n > 8e4) return null;
+    const epoch = new Date(1899, 11, 30);
+    const dt = new Date(epoch.getFullYear(), epoch.getMonth(), epoch.getDate() + Math.floor(n));
+    return dt.getTime();
+  }
+  function isAddressIncomplete(addr) {
+    const a = String(addr ?? "").replace(/\u00A0/g, " ").replace(/\s+/g, " ").trim();
+    if (!a) return true;
+    const hasStreet = /ул\.?|улица|пр-?кт|проспект|пер\.|переулок|бульвар|б-?р\b|шоссе|наб\.|набереж|проезд|площад|\bпл\.|мкр|микрорайон|\bдом\b|\bд\.\s*\d|корп|строение|\bстр\.|ЖК\b|посёлок|поселок|деревн|\bсело\b/iu.test(
+      a
+    );
+    if (hasStreet) return false;
+    if (/\d/.test(a) && a.length >= 18) return false;
+    return true;
+  }
+  function pickBestAddress(candidates) {
+    const list = [...new Set(candidates.map((c) => String(c ?? "").trim()).filter(Boolean))];
+    if (!list.length) return "";
+    const complete = list.filter((a) => !isAddressIncomplete(a));
+    const pool = complete.length ? complete : list;
+    return pool.sort((a, b) => b.length - a.length)[0] || "";
+  }
+  function mostCommonNonEmpty(values) {
+    const counts = /* @__PURE__ */ new Map();
+    for (const v of values) {
+      const s = String(v ?? "").trim();
+      if (!s) continue;
+      if (/давальческ/i.test(s)) continue;
+      counts.set(s, (counts.get(s) || 0) + 1);
+    }
+    let best = "";
+    let bestN = 0;
+    for (const [k, n] of counts) {
+      if (n > bestN || n === bestN && k.length > best.length) {
+        best = k;
+        bestN = n;
+      }
+    }
+    return best;
+  }
   function formatRuDate(ts) {
     if (ts == null || !Number.isFinite(ts)) return "";
     const d = new Date(ts);
@@ -206,7 +251,7 @@
     body = body.replace(/\s+/g, " ").trim();
     if (!body) return "";
     const mosOblastPhrase = /(?:^|[\s,;])(Московская)\s+(?:область|обл\.?)(?=[$\s,;])/iu.exec(body);
-    if (/^Краснодар\s*,/.test(body) || /(?:^|[\s,;])Краснодар\s*(?=,)/iu.test(body) || /(?:^|[\s,;])Краснодар,/iu.test(body))
+    if (!/Краснодарский/iu.test(body) && (/^Краснодар(?:\s|,|$)/iu.test(body) || /(?:^|[\s,;])Краснодар\s*(?=,)/iu.test(body) || /(?:^|[\s,;])Краснодар,/iu.test(body)))
       return "\u041A\u0440\u0430\u0441\u043D\u043E\u0434\u0430\u0440";
     if (/\bгород\s+Москва\b/iu.test(body) || /(?:^|[\s,;])Москва(?:\s*г\.?)?(?=[\s,;]|$)/iu.test(body) && !mosOblastPhrase && !/Московская\s+(?:область|обл)/iu.test(body))
       return "\u041C\u043E\u0441\u043A\u0432\u0430";
@@ -380,17 +425,53 @@
     }
     return out;
   }
+  function resolveLegacyColumnMap(rows, colOverride = {}) {
+    for (let i = 0; i < Math.min(rows.length, 8); i += 1) {
+      const cells = normalizeCells(rows[i]);
+      const lower = cells.map((c) => c.toLowerCase());
+      const find = (...names) => {
+        for (const n of names) {
+          const ix = lower.indexOf(n.toLowerCase());
+          if (ix >= 0) return ix;
+        }
+        return -1;
+      };
+      const tt = find("\u0422\u0422");
+      const addr = find("\u0410\u0434\u0440\u0435\u0441");
+      if (tt < 0 || addr < 0) continue;
+      return {
+        ttName: tt,
+        orderRcc: find("\u0417\u0430\u043A\u0430\u0437") >= 0 ? find("\u0417\u0430\u043A\u0430\u0437") : 1,
+        workType: find("\u041C\u043E\u0434\u0435\u043B\u044C") >= 0 ? find("\u041C\u043E\u0434\u0435\u043B\u044C") : 3,
+        quantity: find("\u041A\u043E\u043B\u0438\u0447\u0435\u0441\u0442\u0432\u043E") >= 0 ? find("\u041A\u043E\u043B\u0438\u0447\u0435\u0441\u0442\u0432\u043E") : 4,
+        address: addr,
+        area: (() => {
+          const a = find("\u041F\u043B\u043E\u0449\u0430\u0434\u044C \u0422\u0422", "\u041F\u043B\u043E\u0449\u0430\u0434\u044C");
+          return a >= 0 ? a : 6;
+        })(),
+        date1: find("\u0414\u0430\u0442\u0430 \u043C\u043E\u043D\u0442\u0430\u0436\u0430") >= 0 ? find("\u0414\u0430\u0442\u0430 \u043C\u043E\u043D\u0442\u0430\u0436\u0430") : 9,
+        date2: find("\u0414\u0430\u0442\u0430 \u043E\u0442\u043A\u0440\u044B\u0442\u0438\u044F") >= 0 ? find("\u0414\u0430\u0442\u0430 \u043E\u0442\u043A\u0440\u044B\u0442\u0438\u044F") : 10,
+        format: find("\u0424\u043E\u0440\u043C\u0430\u0442") >= 0 ? find("\u0424\u043E\u0440\u043C\u0430\u0442") : 13,
+        _headerIndex: i,
+        ...colOverride
+      };
+    }
+    return { ...DEFAULT_COLUMN_MAP, format: 13, _headerIndex: -1, ...colOverride };
+  }
   function extractLegacyRecords(rows, col = {}) {
-    const cm = { ...DEFAULT_COLUMN_MAP, ...col };
+    const cm = resolveLegacyColumnMap(rows, col);
     const out = [];
     const getCell = (cells, idx) => typeof idx === "number" && idx >= 0 ? String(cells[idx] ?? "").trim() : "";
-    for (const raw of rows) {
+    rows.forEach((raw, rowIndex) => {
+      if (rowIndex === cm._headerIndex) return;
       const cells = normalizeCells(raw);
       const tt = getCell(cells, cm.ttName);
-      if (!tt || tt === "\u0422\u0422" || tt === "\u041D\u0430\u0437\u0432\u0430\u043D\u0438\u0435 \u0422\u0422") continue;
+      if (!tt || tt === "\u0422\u0422" || tt === "\u041D\u0430\u0437\u0432\u0430\u043D\u0438\u0435 \u0422\u0422") return;
       const workType = getCell(cells, cm.workType);
-      if (workType === "\u041C\u043E\u0434\u0435\u043B\u044C") continue;
+      if (workType === "\u041C\u043E\u0434\u0435\u043B\u044C") return;
       const qty = parseInt(getCell(cells, cm.quantity), 10);
+      const formatIdx = typeof cm.format === "number" ? cm.format : 13;
+      const format = getCell(cells, formatIdx) || (lastNonEmptyCell(cells) && !/давальческ/i.test(lastNonEmptyCell(cells)) ? lastNonEmptyCell(cells) : "");
       out.push({
         tt,
         rcc: getCell(cells, cm.orderRcc),
@@ -400,10 +481,85 @@
         area: getCell(cells, cm.area),
         date1: getCell(cells, cm.date1),
         date2: getCell(cells, cm.date2),
-        format: lastNonEmptyCell(cells)
+        dates: [getCell(cells, cm.date1), getCell(cells, cm.date2)].filter(Boolean),
+        format
+      });
+    });
+    return out;
+  }
+  function classifyAttachmentMatrix(matrix, fileName = "") {
+    const base = String(fileName).split(/[/\\]/).pop() || "";
+    if (detectInputKind(matrix) === "zakaz") return "zakaz";
+    if (/заказ/i.test(base) && /RCC-/i.test(base)) return "zakaz";
+    const head = matrix.slice(0, 5).map((r) => normalizeCells(r).join("	")).join("\n");
+    if (/(?:^|\t)ТТ(?:\t|$)/m.test(head) && /Адрес/i.test(head)) return "montage";
+    if (/монтаж/i.test(base) || /солюшн/i.test(base) || /эдтех/i.test(base)) return "montage";
+    const legacyProbe = extractLegacyRecords(matrix);
+    if (legacyProbe.length >= 3) return "montage";
+    return "unknown";
+  }
+  function buildTtEnrichmentIndex(montageRecords) {
+    const acc = /* @__PURE__ */ new Map();
+    for (const rec of montageRecords) {
+      const tt = String(rec.tt ?? "").trim();
+      if (!tt) continue;
+      let e = acc.get(tt);
+      if (!e) {
+        e = { addresses: [], formats: [], areas: [], dates: [] };
+        acc.set(tt, e);
+      }
+      if (rec.address) e.addresses.push(rec.address);
+      if (rec.format) e.formats.push(rec.format);
+      if (rec.area) e.areas.push(String(rec.area));
+      if (Array.isArray(rec.dates)) e.dates.push(...rec.dates);
+      else {
+        if (rec.date1) e.dates.push(rec.date1);
+        if (rec.date2) e.dates.push(rec.date2);
+      }
+    }
+    const out = /* @__PURE__ */ new Map();
+    for (const [tt, e] of acc) {
+      out.set(tt, {
+        address: pickBestAddress(e.addresses),
+        format: mostCommonNonEmpty(e.formats),
+        area: e.areas.find((a) => parseArea(a) != null) || e.areas[0] || "",
+        dates: [...new Set(e.dates.filter(Boolean))]
       });
     }
     return out;
+  }
+  function enrichOrderRecords(orderRecords, index, warnings = []) {
+    const warnedTt = /* @__PURE__ */ new Set();
+    return orderRecords.map((rec) => {
+      const info = index.get(rec.tt);
+      if (!info) {
+        if (isAddressIncomplete(rec.address) && !warnedTt.has(rec.tt)) {
+          warnedTt.add(rec.tt);
+          warnings.push(
+            `\u041D\u0435\u043F\u043E\u043B\u043D\u044B\u0439 \u0430\u0434\u0440\u0435\u0441 \u0438 \u043D\u0435\u0442 \u0441\u0442\u0440\u043E\u043A\u0438 \u0432 \u0432\u044B\u0433\u0440\u0443\u0437\u043A\u0435 \u043C\u043E\u043D\u0442\u0430\u0436\u0435\u0439 \u0434\u043B\u044F \xAB${rec.tt}\xBB: "${rec.address}"`
+          );
+        }
+        return { ...rec, dates: [rec.date1, rec.date2].filter(Boolean) };
+      }
+      const next = { ...rec };
+      if (info.address) {
+        if (isAddressIncomplete(rec.address) && rec.address !== info.address && !warnedTt.has(`fix:${rec.tt}`)) {
+          warnedTt.add(`fix:${rec.tt}`);
+          warnings.push(
+            `\u0410\u0434\u0440\u0435\u0441 \xAB${rec.tt}\xBB \u0434\u043E\u043F\u043E\u043B\u043D\u0435\u043D \u0438\u0437 \u0432\u044B\u0433\u0440\u0443\u0437\u043A\u0438 \u043C\u043E\u043D\u0442\u0430\u0436\u0435\u0439: \xAB${rec.address || "\u2205"}\xBB \u2192 \xAB${info.address}\xBB`
+          );
+        }
+        next.address = info.address;
+      }
+      if (info.format) next.format = info.format;
+      if (info.area) next.area = info.area;
+      next.dates = [
+        ...new Set(
+          [rec.date1, rec.date2, ...info.dates || []].map((d) => String(d ?? "").trim()).filter(Boolean)
+        )
+      ];
+      return next;
+    });
   }
   function normalizeMatrixToRecords(rows, opts = {}) {
     const kind = opts.inputKind && opts.inputKind !== "auto" ? opts.inputKind : detectInputKind(rows);
@@ -449,9 +605,10 @@
       }
       const areaNum = parseArea(rec.area);
       if (areaNum != null) agg.areaValues.push(areaNum);
-      agg.dateVals.push(parseRuDate(rec.date1), parseRuDate(rec.date2));
+      const dateRawList = Array.isArray(rec.dates) && rec.dates.length ? rec.dates : [rec.date1, rec.date2];
+      for (const d of dateRawList) agg.dateVals.push(parseFlexibleDate(d));
       const fmt = String(rec.format ?? "").trim();
-      if (fmt) agg.formats.push(fmt);
+      if (fmt && !/давальческ/i.test(fmt)) agg.formats.push(fmt);
     }
     map.forEach((agg, tt) => {
       if (agg.addressConflict)
@@ -523,6 +680,17 @@
   function transformFromMatrix(parsedRows, opts = {}) {
     const warnings = opts.warnings ?? [];
     const { kind, records } = normalizeMatrixToRecords(parsedRows, opts);
+    if (kind === "zakaz") {
+      const seen = /* @__PURE__ */ new Set();
+      for (const rec of records) {
+        if (isAddressIncomplete(rec.address) && !seen.has(rec.tt)) {
+          seen.add(rec.tt);
+          warnings.push(
+            `\u041D\u0435\u043F\u043E\u043B\u043D\u044B\u0439 \u0430\u0434\u0440\u0435\u0441 \u0443 \xAB${rec.tt}\xBB: "${rec.address}" \u2014 \u043B\u0443\u0447\u0448\u0435 \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044C ZIP \u0441 \u0432\u044B\u0433\u0440\u0443\u0437\u043A\u043E\u0439 \xAB\u042D\u0434\u0442\u0435\u0445 \u0421\u043E\u043B\u044E\u0448\u043D \u043C\u043E\u043D\u0442\u0430\u0436\u0438\xBB`
+          );
+        }
+      }
+    }
     const groupMap = groupAndAggregateRecords(records, warnings);
     const outRows = buildOutputRows(groupMap, opts);
     const warningsByTtFlags = outRows.map((r) => ttHasAttention(String(r["\u041D\u0430\u0437\u0432\u0430\u043D\u0438\u0435 \u0422\u0422"]), warnings));
@@ -532,6 +700,64 @@
       warningsByTtFlags,
       inputKind: kind,
       sourceRecords: records.length
+    };
+  }
+  function processAttachmentBundle(files, opts = {}) {
+    const warnings = opts.warnings ?? [];
+    let orderRecords = [];
+    let montageRecords = [];
+    const zakazFiles = [];
+    const montageFiles = [];
+    for (const f of files) {
+      const role = classifyAttachmentMatrix(f.matrix, f.name);
+      if (role === "zakaz") {
+        orderRecords = orderRecords.concat(extractZakazRecords(f.matrix));
+        zakazFiles.push(f.name);
+      } else if (role === "montage") {
+        montageRecords = montageRecords.concat(extractLegacyRecords(f.matrix));
+        montageFiles.push(f.name);
+      } else {
+        warnings.push(`\u041F\u0440\u043E\u043F\u0443\u0449\u0435\u043D \u0444\u0430\u0439\u043B \u0431\u0435\u0437 \u0440\u0430\u0441\u043F\u043E\u0437\u043D\u0430\u043D\u043D\u043E\u0439 \u0442\u0430\u0431\u043B\u0438\u0446\u044B: ${f.name}`);
+      }
+    }
+    let records;
+    let mode;
+    if (orderRecords.length && montageRecords.length) {
+      const index = buildTtEnrichmentIndex(montageRecords);
+      records = enrichOrderRecords(orderRecords, index, warnings);
+      mode = "zakaz+montage";
+    } else if (orderRecords.length) {
+      records = orderRecords.map((r) => ({
+        ...r,
+        dates: [r.date1, r.date2].filter(Boolean)
+      }));
+      mode = "zakaz";
+      const seen = /* @__PURE__ */ new Set();
+      for (const rec of records) {
+        if (isAddressIncomplete(rec.address) && !seen.has(rec.tt)) {
+          seen.add(rec.tt);
+          warnings.push(
+            `\u041D\u0435\u043F\u043E\u043B\u043D\u044B\u0439 \u0430\u0434\u0440\u0435\u0441 \u0443 \xAB${rec.tt}\xBB: "${rec.address}" \u2014 \u0432 \u0430\u0440\u0445\u0438\u0432\u0435 \u043D\u0435\u0442 \u0432\u044B\u0433\u0440\u0443\u0437\u043A\u0438 \u043C\u043E\u043D\u0442\u0430\u0436\u0435\u0439`
+          );
+        }
+      }
+    } else if (montageRecords.length) {
+      records = montageRecords;
+      mode = "montage";
+    } else {
+      throw new Error("\u041D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u043E \u043D\u0438 \u0444\u0430\u0439\u043B\u0430 \u0437\u0430\u043A\u0430\u0437\u0430, \u043D\u0438 \u0432\u044B\u0433\u0440\u0443\u0437\u043A\u0438 \u043C\u043E\u043D\u0442\u0430\u0436\u0435\u0439 (.xlsx)");
+    }
+    const groupMap = groupAndAggregateRecords(records, warnings);
+    const outRows = buildOutputRows(groupMap, opts);
+    const warningsByTtFlags = outRows.map((r) => ttHasAttention(String(r["\u041D\u0430\u0437\u0432\u0430\u043D\u0438\u0435 \u0422\u0422"]), warnings));
+    return {
+      rows: outRows,
+      warnings,
+      warningsByTtFlags,
+      inputKind: mode,
+      sourceRecords: records.length,
+      zakazFiles,
+      montageFiles
     };
   }
   var GOLDEN_ZAKAZ_MATRIX = [
@@ -567,65 +793,73 @@
     /** @type {HTMLInputElement} */
     $("file-xlsx")
   );
-  var PARSE_OPTS_BASE = {
-    skipFirstRow: false,
-    columns: DEFAULT_COLUMN_MAP
-  };
   var lastResult = [];
   var lastWarnings = [];
   var lastWarnFlags = [];
+  var loadedBundle = null;
+  function applyResult(payload, metaText) {
+    lastResult = payload.rows;
+    lastWarnings = payload.warnings;
+    lastWarnFlags = payload.warningsByTtFlags;
+    $("meta-line").textContent = metaText;
+    renderWarnings(lastWarnings);
+    $("warnings-block").hidden = lastWarnings.length === 0;
+    renderTable();
+  }
+  function clearResult(errorText) {
+    lastResult = [];
+    lastWarnings = [];
+    lastWarnFlags = [];
+    renderTable();
+    renderWarnings([]);
+    $("warnings-block").hidden = true;
+    if (errorText) $("error-msg").textContent = errorText;
+  }
   function generate() {
-    const raw = $("paste").value;
     $("error-msg").textContent = "";
     $("meta-line").textContent = "";
-    if (!raw.trim()) {
-      lastResult = [];
-      lastWarnings = [];
-      lastWarnFlags = [];
-      renderTable();
-      renderWarnings([]);
-      $("error-msg").textContent = "\u0414\u043E\u0431\u0430\u0432\u044C\u0442\u0435 \u0434\u0430\u043D\u043D\u044B\u0435: \u0432\u0441\u0442\u0430\u0432\u044C\u0442\u0435 \u0442\u0435\u043A\u0441\u0442 \u0438\u043B\u0438 \u0432\u044B\u0431\u0435\u0440\u0438\u0442\u0435 \u0444\u0430\u0439\u043B.";
-      $("warnings-block").hidden = true;
-      return;
-    }
+    const queueVal = $("queue-input").value.trim();
     try {
-      const { rows: matrix } = parsePaste(raw, PARSE_OPTS_BASE);
+      if (loadedBundle && loadedBundle.length) {
+        const warns2 = [];
+        const payload2 = processAttachmentBundle(loadedBundle, {
+          queueDefault: queueVal,
+          warnings: warns2
+        });
+        const z = payload2.zakazFiles?.length ?? 0;
+        const m = payload2.montageFiles?.length ?? 0;
+        applyResult(
+          payload2,
+          `\u0413\u043E\u0442\u043E\u0432\u043E (${payload2.inputKind}): \u0437\u0430\u043A\u0430\u0437\u043E\u0432 ${z}, \u0432\u044B\u0433\u0440\u0443\u0437\u043E\u043A \u043C\u043E\u043D\u0442\u0430\u0436\u0435\u0439 ${m}, \u043F\u043E\u0437\u0438\u0446\u0438\u0439 ${payload2.sourceRecords}, \u0422\u0422 ${payload2.rows.length}.`
+        );
+        return;
+      }
+      const raw = $("paste").value;
+      if (!raw.trim()) {
+        clearResult("\u0414\u043E\u0431\u0430\u0432\u044C\u0442\u0435 \u0434\u0430\u043D\u043D\u044B\u0435: ZIP/Excel \u0438\u043B\u0438 \u0432\u0441\u0442\u0430\u0432\u044C\u0442\u0435 \u0442\u0430\u0431\u043B\u0438\u0446\u0443.");
+        return;
+      }
+      const { rows: matrix } = parsePaste(raw, { skipFirstRow: false });
       if (!matrix.length) {
         lastResult = [];
-        lastWarnings = ["\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u0440\u0430\u0437\u043E\u0431\u0440\u0430\u0442\u044C \u0441\u0442\u0440\u043E\u043A\u0438 \u2014 \u043F\u0440\u043E\u0432\u0435\u0440\u044C\u0442\u0435, \u0447\u0442\u043E \u0432\u0441\u0442\u0430\u0432\u043B\u0435\u043D \u0444\u0440\u0430\u0433\u043C\u0435\u043D\u0442 \u0442\u0430\u0431\u043B\u0438\u0446\u044B."];
+        lastWarnings = ["\u041D\u0435 \u0443\u0434\u0430\u043B\u043E\u0441\u044C \u0440\u0430\u0437\u043E\u0431\u0440\u0430\u0442\u044C \u0441\u0442\u0440\u043E\u043A\u0438 \u2014 \u043F\u0440\u043E\u0432\u0435\u0440\u044C\u0442\u0435 \u0432\u0441\u0442\u0430\u0432\u043A\u0443."];
         lastWarnFlags = [];
         renderTable();
         renderWarnings(lastWarnings);
         $("warnings-block").hidden = false;
         return;
       }
-      const queueVal = $("queue-input").value.trim();
       const warns = [];
-      const { rows, warnings, warningsByTtFlags, inputKind, sourceRecords } = transformFromMatrix(
-        matrix,
-        {
-          queueDefault: queueVal,
-          columns: PARSE_OPTS_BASE.columns,
-          warnings: warns
-        }
+      const payload = transformFromMatrix(matrix, {
+        queueDefault: queueVal,
+        warnings: warns
+      });
+      applyResult(
+        payload,
+        `\u0413\u043E\u0442\u043E\u0432\u043E (${payload.inputKind}): \u043F\u043E\u0437\u0438\u0446\u0438\u0439 ${payload.sourceRecords ?? "\u2014"}, \u0422\u0422 ${payload.rows.length}.`
       );
-      lastResult = rows;
-      lastWarnings = warnings;
-      lastWarnFlags = warningsByTtFlags;
-      const kindLabel = inputKind === "zakaz" ? "\u0437\u0430\u043A\u0430\u0437 Magnit" : "\u043F\u043B\u043E\u0441\u043A\u0430\u044F \u0432\u044B\u0433\u0440\u0443\u0437\u043A\u0430";
-      $("meta-line").textContent = `\u0413\u043E\u0442\u043E\u0432\u043E (${kindLabel}): \u043F\u043E\u0437\u0438\u0446\u0438\u0439 ${sourceRecords ?? "\u2014"}, \u0442\u043E\u0440\u0433\u043E\u0432\u044B\u0445 \u0442\u043E\u0447\u0435\u043A ${rows.length}.`;
-      renderWarnings(lastWarnings);
-      $("warnings-block").hidden = warnings.length === 0;
-      renderTable();
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      $("error-msg").textContent = msg;
-      lastResult = [];
-      lastWarnings = [];
-      lastWarnFlags = [];
-      renderTable();
-      renderWarnings([]);
-      $("warnings-block").hidden = true;
+      clearResult(e instanceof Error ? e.message : String(e));
     }
   }
   function renderWarnings(messages) {
@@ -712,6 +946,17 @@
     });
     downloadBlob("svod_tt.xlsx", blob);
   }
+  function xlsxBufferToMatrix(data) {
+    const XLSX = (
+      /** @type {any} */
+      window.XLSX
+    );
+    const wb = XLSX.read(new Uint8Array(data), { type: "array" });
+    const wsName = wb.SheetNames[0];
+    const ws = wb.Sheets[wsName];
+    const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: "" });
+    return { wsName, rows: rows.map((r) => Array.isArray(r) ? r.map((c) => String(c ?? "")) : []) };
+  }
   function wireFileLabel() {
     const input = $("file-xlsx");
     const label = document.querySelector("label.file-label");
@@ -722,7 +967,7 @@
       }
     });
   }
-  function readXlsxFile(file) {
+  function readXlsxAsBundle(file) {
     const XLSX = (
       /** @type {any} */
       window.XLSX
@@ -732,16 +977,13 @@
     const reader = new FileReader();
     reader.onload = (ev) => {
       try {
-        const data = new Uint8Array(
+        const { wsName, rows } = xlsxBufferToMatrix(
           /** @type {ArrayBuffer} */
           ev.target?.result
         );
-        const wb = XLSX.read(data, { type: "array" });
-        const wsName = wb.SheetNames[0];
-        const ws = wb.Sheets[wsName];
-        const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: "" });
-        $("paste").value = rows.map((r) => (Array.isArray(r) ? r : []).join("	")).join("\n");
-        $("meta-line").textContent = `\u0417\u0430\u0433\u0440\u0443\u0436\u0435\u043D \u043B\u0438\u0441\u0442 \xAB${wsName}\xBB. \u041D\u0430\u0436\u043C\u0438\u0442\u0435 \xAB\u0421\u0433\u0435\u043D\u0435\u0440\u0438\u0440\u043E\u0432\u0430\u0442\u044C \u0440\u0435\u0437\u0443\u043B\u044C\u0442\u0430\u0442\xBB.`;
+        loadedBundle = [{ name: file.name, matrix: rows }];
+        $("paste").value = "";
+        $("meta-line").textContent = `\u0417\u0430\u0433\u0440\u0443\u0436\u0435\u043D \xAB${file.name}\xBB (\u043B\u0438\u0441\u0442 \xAB${wsName}\xBB). \u0423\u043A\u0430\u0436\u0438\u0442\u0435 \u043E\u0447\u0435\u0440\u0435\u0434\u044C \u0438 \u043D\u0430\u0436\u043C\u0438\u0442\u0435 \xAB\u0421\u0433\u0435\u043D\u0435\u0440\u0438\u0440\u043E\u0432\u0430\u0442\u044C \u0440\u0435\u0437\u0443\u043B\u044C\u0442\u0430\u0442\xBB.`;
         inputEl.value = "";
       } catch (e) {
         $("error-msg").textContent = e instanceof Error ? e.message : String(e);
@@ -749,8 +991,60 @@
     };
     reader.readAsArrayBuffer(file);
   }
+  async function readZipAsBundle(file) {
+    const JSZip = (
+      /** @type {any} */
+      window.JSZip
+    );
+    const XLSX = (
+      /** @type {any} */
+      window.XLSX
+    );
+    if (!file || !JSZip || !XLSX) {
+      $("error-msg").textContent = "\u0414\u043B\u044F ZIP \u043D\u0443\u0436\u043D\u044B \u0431\u0438\u0431\u043B\u0438\u043E\u0442\u0435\u043A\u0438 JSZip \u0438 SheetJS (\u043F\u0440\u043E\u0432\u0435\u0440\u044C\u0442\u0435 \u0438\u043D\u0442\u0435\u0440\u043D\u0435\u0442/CDN).";
+      return;
+    }
+    $("error-msg").textContent = "";
+    try {
+      const zip = await JSZip.loadAsync(file);
+      const bundle = [];
+      const names = Object.keys(zip.files).sort();
+      for (const name of names) {
+        const entry = zip.files[name];
+        if (!entry || entry.dir) continue;
+        if (!/\.xlsx$/i.test(name) && !/\.xls$/i.test(name)) continue;
+        const buf = await entry.async("arraybuffer");
+        const shortName = name.split(/[/\\]/).pop() || name;
+        try {
+          const { rows } = xlsxBufferToMatrix(buf);
+          bundle.push({ name: shortName, matrix: rows });
+        } catch (e) {
+          console.warn("skip xlsx in zip", name, e);
+        }
+      }
+      if (!bundle.length) {
+        $("error-msg").textContent = "\u0412 ZIP \u043D\u0435\u0442 \u0447\u0438\u0442\u0430\u0435\u043C\u044B\u0445 .xlsx \u0444\u0430\u0439\u043B\u043E\u0432.";
+        return;
+      }
+      loadedBundle = bundle;
+      $("paste").value = "";
+      $("meta-line").textContent = `ZIP \xAB${file.name}\xBB: \u043D\u0430\u0439\u0434\u0435\u043D\u043E xlsx ${bundle.length} (${bundle.map((b) => b.name).join("; ")}). \u0423\u043A\u0430\u0436\u0438\u0442\u0435 \u043E\u0447\u0435\u0440\u0435\u0434\u044C \u0438 \u043D\u0430\u0436\u043C\u0438\u0442\u0435 \xAB\u0421\u0433\u0435\u043D\u0435\u0440\u0438\u0440\u043E\u0432\u0430\u0442\u044C \u0440\u0435\u0437\u0443\u043B\u044C\u0442\u0430\u0442\xBB.`;
+      inputEl.value = "";
+    } catch (e) {
+      $("error-msg").textContent = e instanceof Error ? e.message : String(e);
+    }
+  }
+  function onFileChosen(file) {
+    if (!file) return;
+    loadedBundle = null;
+    if (/\.zip$/i.test(file.name)) readZipAsBundle(file);
+    else readXlsxAsBundle(file);
+  }
   function wireEvents() {
     $("btn-generate").addEventListener("click", generate);
+    $("paste").addEventListener("input", () => {
+      if ($("paste").value.trim()) loadedBundle = null;
+    });
     $("btn-copy-tsv").addEventListener(
       "click",
       () => copyTsv().catch((e) => {
@@ -764,7 +1058,7 @@
         /** @type {HTMLInputElement} */
         ev.target.files?.[0]
       );
-      if (f) readXlsxFile(f);
+      if (f) onFileChosen(f);
     });
     wireFileLabel();
   }
@@ -781,5 +1075,8 @@
   window.addEventListener("load", () => {
     if (!window.XLSX && $("warn-xlsx"))
       $("warn-xlsx").textContent = "\u0411\u0438\u0431\u043B\u0438\u043E\u0442\u0435\u043A\u0430 \u0434\u043B\u044F Excel \u043D\u0435 \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u043B\u0430\u0441\u044C \u2014 \u043F\u0440\u043E\u0432\u0435\u0440\u044C\u0442\u0435 \u0438\u043D\u0442\u0435\u0440\u043D\u0435\u0442/CDN.";
+    else if (!/** @type {any} */
+    window.JSZip && $("warn-xlsx"))
+      $("warn-xlsx").textContent = "JSZip \u043D\u0435 \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u043B\u0441\u044F \u2014 ZIP-\u0430\u0440\u0445\u0438\u0432\u044B \u0431\u0443\u0434\u0443\u0442 \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u043D\u044B.";
   });
 })();

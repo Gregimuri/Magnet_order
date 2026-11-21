@@ -1,8 +1,8 @@
 import {
   OUTPUT_HEADERS,
-  DEFAULT_COLUMN_MAP,
   parsePaste,
   transformFromMatrix,
+  processAttachmentBundle,
   rowsToAoA,
 } from './transform.js';
 
@@ -14,11 +14,6 @@ const $ = (id) => {
 
 const inputEl = /** @type {HTMLInputElement} */ ($('file-xlsx'));
 
-const PARSE_OPTS_BASE = {
-  skipFirstRow: false,
-  columns: DEFAULT_COLUMN_MAP,
-};
-
 /** @type {Record<string, string|number>[]} */
 let lastResult = [];
 
@@ -28,28 +23,64 @@ let lastWarnings = [];
 /** @type {boolean[]} */
 let lastWarnFlags = [];
 
+/**
+ * Последний разобранный пакет (ZIP/xlsx). Если задан — «Сгенерировать» использует его,
+ * а не textarea (textarea только для ручной вставки).
+ * @type {{ name: string, matrix: string[][] }[] | null}
+ */
+let loadedBundle = null;
+
+function applyResult(payload, metaText) {
+  lastResult = payload.rows;
+  lastWarnings = payload.warnings;
+  lastWarnFlags = payload.warningsByTtFlags;
+  $('meta-line').textContent = metaText;
+  renderWarnings(lastWarnings);
+  $('warnings-block').hidden = lastWarnings.length === 0;
+  renderTable();
+}
+
+function clearResult(errorText) {
+  lastResult = [];
+  lastWarnings = [];
+  lastWarnFlags = [];
+  renderTable();
+  renderWarnings([]);
+  $('warnings-block').hidden = true;
+  if (errorText) $('error-msg').textContent = errorText;
+}
+
 function generate() {
-  const raw = $('paste').value;
   $('error-msg').textContent = '';
   $('meta-line').textContent = '';
-
-  if (!raw.trim()) {
-    lastResult = [];
-    lastWarnings = [];
-    lastWarnFlags = [];
-    renderTable();
-    renderWarnings([]);
-    $('error-msg').textContent = 'Добавьте данные: вставьте текст или выберите файл.';
-    $('warnings-block').hidden = true;
-    return;
-  }
+  const queueVal = $('queue-input').value.trim();
 
   try {
-    const { rows: matrix } = parsePaste(raw, PARSE_OPTS_BASE);
+    if (loadedBundle && loadedBundle.length) {
+      const warns = [];
+      const payload = processAttachmentBundle(loadedBundle, {
+        queueDefault: queueVal,
+        warnings: warns,
+      });
+      const z = payload.zakazFiles?.length ?? 0;
+      const m = payload.montageFiles?.length ?? 0;
+      applyResult(
+        payload,
+        `Готово (${payload.inputKind}): заказов ${z}, выгрузок монтажей ${m}, позиций ${payload.sourceRecords}, ТТ ${payload.rows.length}.`,
+      );
+      return;
+    }
 
+    const raw = $('paste').value;
+    if (!raw.trim()) {
+      clearResult('Добавьте данные: ZIP/Excel или вставьте таблицу.');
+      return;
+    }
+
+    const { rows: matrix } = parsePaste(raw, { skipFirstRow: false });
     if (!matrix.length) {
       lastResult = [];
-      lastWarnings = ['Не удалось разобрать строки — проверьте, что вставлен фрагмент таблицы.'];
+      lastWarnings = ['Не удалось разобрать строки — проверьте вставку.'];
       lastWarnFlags = [];
       renderTable();
       renderWarnings(lastWarnings);
@@ -57,41 +88,23 @@ function generate() {
       return;
     }
 
-    const queueVal = $('queue-input').value.trim();
     const warns = [];
-    const { rows, warnings, warningsByTtFlags, inputKind, sourceRecords } = transformFromMatrix(
-      matrix,
-      {
-        queueDefault: queueVal,
-        columns: PARSE_OPTS_BASE.columns,
-        warnings: warns,
-      },
+    const payload = transformFromMatrix(matrix, {
+      queueDefault: queueVal,
+      warnings: warns,
+    });
+    applyResult(
+      payload,
+      `Готово (${payload.inputKind}): позиций ${payload.sourceRecords ?? '—'}, ТТ ${payload.rows.length}.`,
     );
-
-    lastResult = rows;
-    lastWarnings = warnings;
-    lastWarnFlags = warningsByTtFlags;
-    const kindLabel = inputKind === 'zakaz' ? 'заказ Magnit' : 'плоская выгрузка';
-    $('meta-line').textContent = `Готово (${kindLabel}): позиций ${sourceRecords ?? '—'}, торговых точек ${rows.length}.`;
-    renderWarnings(lastWarnings);
-    $('warnings-block').hidden = warnings.length === 0;
-    renderTable();
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    $('error-msg').textContent = msg;
-    lastResult = [];
-    lastWarnings = [];
-    lastWarnFlags = [];
-    renderTable();
-    renderWarnings([]);
-    $('warnings-block').hidden = true;
+    clearResult(e instanceof Error ? e.message : String(e));
   }
 }
 
 function renderWarnings(messages) {
   const ul = $('warnings-ul');
   ul.replaceChildren();
-
   messages.forEach((m) => {
     const li = document.createElement('li');
     li.textContent = m;
@@ -184,6 +197,17 @@ function downloadXlsx() {
   downloadBlob('svod_tt.xlsx', blob);
 }
 
+/** @param {ArrayBuffer} data */
+function xlsxBufferToMatrix(data) {
+  const XLSX = /** @type {any} */ (window).XLSX;
+  const wb = XLSX.read(new Uint8Array(data), { type: 'array' });
+  const wsName = wb.SheetNames[0];
+  const ws = wb.Sheets[wsName];
+  /** @type {string[][]} */
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: '' });
+  return { wsName, rows: rows.map((r) => (Array.isArray(r) ? r.map((c) => String(c ?? '')) : [])) };
+}
+
 function wireFileLabel() {
   const input = $('file-xlsx');
   const label = document.querySelector('label.file-label');
@@ -195,22 +219,18 @@ function wireFileLabel() {
   });
 }
 
-function readXlsxFile(file) {
+function readXlsxAsBundle(file) {
   const XLSX = /** @type {any} */ (window).XLSX;
   if (!file || !XLSX) return;
   $('error-msg').textContent = '';
   const reader = new FileReader();
   reader.onload = (ev) => {
     try {
-      const data = new Uint8Array(/** @type {ArrayBuffer} */ (ev.target?.result));
-      const wb = XLSX.read(data, { type: 'array' });
-      const wsName = wb.SheetNames[0];
-      const ws = wb.Sheets[wsName];
-      /** @type {string[][]} */
-      const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: '' });
-      $('paste').value = rows.map((r) => (Array.isArray(r) ? r : []).join('\t')).join('\n');
+      const { wsName, rows } = xlsxBufferToMatrix(/** @type {ArrayBuffer} */ (ev.target?.result));
+      loadedBundle = [{ name: file.name, matrix: rows }];
+      $('paste').value = '';
       $('meta-line').textContent =
-        `Загружен лист «${wsName}». Нажмите «Сгенерировать результат».`;
+        `Загружен «${file.name}» (лист «${wsName}»). Укажите очередь и нажмите «Сгенерировать результат».`;
       inputEl.value = '';
     } catch (e) {
       $('error-msg').textContent = e instanceof Error ? e.message : String(e);
@@ -219,8 +239,59 @@ function readXlsxFile(file) {
   reader.readAsArrayBuffer(file);
 }
 
+async function readZipAsBundle(file) {
+  const JSZip = /** @type {any} */ (window).JSZip;
+  const XLSX = /** @type {any} */ (window).XLSX;
+  if (!file || !JSZip || !XLSX) {
+    $('error-msg').textContent = 'Для ZIP нужны библиотеки JSZip и SheetJS (проверьте интернет/CDN).';
+    return;
+  }
+  $('error-msg').textContent = '';
+  try {
+    const zip = await JSZip.loadAsync(file);
+    /** @type {{ name: string, matrix: string[][] }[]} */
+    const bundle = [];
+    const names = Object.keys(zip.files).sort();
+    for (const name of names) {
+      const entry = zip.files[name];
+      if (!entry || entry.dir) continue;
+      if (!/\.xlsx$/i.test(name) && !/\.xls$/i.test(name)) continue;
+      const buf = await entry.async('arraybuffer');
+      const shortName = name.split(/[/\\]/).pop() || name;
+      try {
+        const { rows } = xlsxBufferToMatrix(buf);
+        bundle.push({ name: shortName, matrix: rows });
+      } catch (e) {
+        console.warn('skip xlsx in zip', name, e);
+      }
+    }
+    if (!bundle.length) {
+      $('error-msg').textContent = 'В ZIP нет читаемых .xlsx файлов.';
+      return;
+    }
+    loadedBundle = bundle;
+    $('paste').value = '';
+    $('meta-line').textContent =
+      `ZIP «${file.name}»: найдено xlsx ${bundle.length} (${bundle.map((b) => b.name).join('; ')}). Укажите очередь и нажмите «Сгенерировать результат».`;
+    inputEl.value = '';
+  } catch (e) {
+    $('error-msg').textContent = e instanceof Error ? e.message : String(e);
+  }
+}
+
+function onFileChosen(file) {
+  if (!file) return;
+  loadedBundle = null;
+  if (/\.zip$/i.test(file.name)) readZipAsBundle(file);
+  else readXlsxAsBundle(file);
+}
+
 function wireEvents() {
   $('btn-generate').addEventListener('click', generate);
+
+  $('paste').addEventListener('input', () => {
+    if ($('paste').value.trim()) loadedBundle = null;
+  });
 
   $('btn-copy-tsv').addEventListener('click', () =>
     copyTsv().catch((e) => {
@@ -233,7 +304,7 @@ function wireEvents() {
 
   inputEl.addEventListener('change', (ev) => {
     const f = /** @type {HTMLInputElement} */ (ev.target).files?.[0];
-    if (f) readXlsxFile(f);
+    if (f) onFileChosen(f);
   });
 
   wireFileLabel();
@@ -254,4 +325,6 @@ $('btn-download-xlsx').disabled = true;
 window.addEventListener('load', () => {
   if (!window.XLSX && $('warn-xlsx'))
     $('warn-xlsx').textContent = 'Библиотека для Excel не загрузилась — проверьте интернет/CDN.';
+  else if (!(/** @type {any} */ (window).JSZip) && $('warn-xlsx'))
+    $('warn-xlsx').textContent = 'JSZip не загрузился — ZIP-архивы будут недоступны.';
 });

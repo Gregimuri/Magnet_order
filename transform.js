@@ -93,6 +93,7 @@ export const ZAKAZ_COLUMN_MAP = {
  * @property {string} [area]
  * @property {string} [date1]
  * @property {string} [date2]
+ * @property {string[]} [dates] — все даты позиции (заказ + выгрузка)
  * @property {string} [format]
  */
 
@@ -102,6 +103,12 @@ export const ZAKAZ_COLUMN_MAP = {
  * @property {boolean} [skipFirstRow=false] — трактовать первую строку как заголовок
  * @property {typeof DEFAULT_COLUMN_MAP} [columns]
  * @property {'zakaz'|'legacy'|'auto'} [inputKind]
+ */
+
+/**
+ * @typedef {Object} AttachmentFile
+ * @property {string} name
+ * @property {string[][]} matrix
  */
 
 /**
@@ -318,6 +325,74 @@ export function parseRuDate(d) {
   return dt.getTime();
 }
 
+/**
+ * Дата из «ДД.ММ.ГГГГ» или Excel-serial (как в выгрузке монтажей).
+ * @param {string|number|null|undefined} raw
+ * @returns {number | null}
+ */
+export function parseFlexibleDate(raw) {
+  if (raw == null || raw === '') return null;
+  const ru = parseRuDate(String(raw));
+  if (ru != null) return ru;
+  const n = Number(String(raw).trim().replace(',', '.'));
+  if (!Number.isFinite(n) || n < 30000 || n > 80000) return null;
+  const epoch = new Date(1899, 11, 30);
+  const dt = new Date(epoch.getFullYear(), epoch.getMonth(), epoch.getDate() + Math.floor(n));
+  return dt.getTime();
+}
+
+/**
+ * Адрес из заказа часто обрезан до города/региона без улицы.
+ * @param {string} addr
+ */
+export function isAddressIncomplete(addr) {
+  const a = String(addr ?? '')
+    .replace(/\u00A0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!a) return true;
+  const hasStreet =
+    /ул\.?|улица|пр-?кт|проспект|пер\.|переулок|бульвар|б-?р\b|шоссе|наб\.|набереж|проезд|площад|\bпл\.|мкр|микрорайон|\bдом\b|\bд\.\s*\d|корп|строение|\bстр\.|ЖК\b|посёлок|поселок|деревн|\bсело\b/iu.test(
+      a,
+    );
+  if (hasStreet) return false;
+  /** «Краснодар Казбекская 12_мини» — улица без слова «ул», но есть номер */
+  if (/\d/.test(a) && a.length >= 18) return false;
+  return true;
+}
+
+/**
+ * @param {string[]} candidates
+ */
+export function pickBestAddress(candidates) {
+  const list = [...new Set(candidates.map((c) => String(c ?? '').trim()).filter(Boolean))];
+  if (!list.length) return '';
+  const complete = list.filter((a) => !isAddressIncomplete(a));
+  const pool = complete.length ? complete : list;
+  return pool.sort((a, b) => b.length - a.length)[0] || '';
+}
+
+/** @param {string[]} values */
+function mostCommonNonEmpty(values) {
+  /** @type {Map<string, number>} */
+  const counts = new Map();
+  for (const v of values) {
+    const s = String(v ?? '').trim();
+    if (!s) continue;
+    if (/давальческ/i.test(s)) continue;
+    counts.set(s, (counts.get(s) || 0) + 1);
+  }
+  let best = '';
+  let bestN = 0;
+  for (const [k, n] of counts) {
+    if (n > bestN || (n === bestN && k.length > best.length)) {
+      best = k;
+      bestN = n;
+    }
+  }
+  return best;
+}
+
 /** @param {number | null} ts */
 export function formatRuDate(ts) {
   if (ts == null || !Number.isFinite(ts)) return '';
@@ -377,9 +452,10 @@ export function deriveRegion(address) {
     /(?:^|[\s,;])(Московская)\s+(?:область|обл\.?)(?=[$\s,;])/iu.exec(body);
 
   if (
-    /^Краснодар\s*,/.test(body) ||
-    /(?:^|[\s,;])Краснодар\s*(?=,)/iu.test(body) ||
-    /(?:^|[\s,;])Краснодар,/iu.test(body)
+    !/Краснодарский/iu.test(body) &&
+    (/^Краснодар(?:\s|,|$)/iu.test(body) ||
+      /(?:^|[\s,;])Краснодар\s*(?=,)/iu.test(body) ||
+      /(?:^|[\s,;])Краснодар,/iu.test(body))
   )
     return 'Краснодар';
 
@@ -673,25 +749,71 @@ export function extractZakazRecords(rows) {
 }
 
 /**
- * Старая плоская выгрузка монтажей (одна строка = одна позиция).
+ * Ищет строку заголовка выгрузки «ТТ / Заказ / Адрес / Формат».
  * @param {string[][]} rows
- * @param {Partial<typeof DEFAULT_COLUMN_MAP>} col
+ * @param {Partial<typeof DEFAULT_COLUMN_MAP & {format?: number}>} [colOverride]
+ */
+export function resolveLegacyColumnMap(rows, colOverride = {}) {
+  for (let i = 0; i < Math.min(rows.length, 8); i += 1) {
+    const cells = normalizeCells(rows[i]);
+    const lower = cells.map((c) => c.toLowerCase());
+    const find = (...names) => {
+      for (const n of names) {
+        const ix = lower.indexOf(n.toLowerCase());
+        if (ix >= 0) return ix;
+      }
+      return -1;
+    };
+    const tt = find('ТТ');
+    const addr = find('Адрес');
+    if (tt < 0 || addr < 0) continue;
+    return {
+      ttName: tt,
+      orderRcc: find('Заказ') >= 0 ? find('Заказ') : 1,
+      workType: find('Модель') >= 0 ? find('Модель') : 3,
+      quantity: find('Количество') >= 0 ? find('Количество') : 4,
+      address: addr,
+      area: (() => {
+        const a = find('Площадь ТТ', 'Площадь');
+        return a >= 0 ? a : 6;
+      })(),
+      date1: find('Дата монтажа') >= 0 ? find('Дата монтажа') : 9,
+      date2: find('Дата открытия') >= 0 ? find('Дата открытия') : 10,
+      format: find('Формат') >= 0 ? find('Формат') : 13,
+      _headerIndex: i,
+      ...colOverride,
+    };
+  }
+  return { ...DEFAULT_COLUMN_MAP, format: 13, _headerIndex: -1, ...colOverride };
+}
+
+/**
+ * Плоская выгрузка монтажей (Эдтех Солюшн монтажи …).
+ * @param {string[][]} rows
+ * @param {Partial<typeof DEFAULT_COLUMN_MAP & {format?: number}>} col
  * @returns {SourceRecord[]}
  */
 export function extractLegacyRecords(rows, col = {}) {
-  const cm = { ...DEFAULT_COLUMN_MAP, ...col };
+  const cm = resolveLegacyColumnMap(rows, col);
   /** @type {SourceRecord[]} */
   const out = [];
   const getCell = (cells, idx) =>
     typeof idx === 'number' && idx >= 0 ? String(cells[idx] ?? '').trim() : '';
 
-  for (const raw of rows) {
+  rows.forEach((raw, rowIndex) => {
+    if (rowIndex === cm._headerIndex) return;
     const cells = normalizeCells(raw);
     const tt = getCell(cells, cm.ttName);
-    if (!tt || tt === 'ТТ' || tt === 'Название ТТ') continue;
+    if (!tt || tt === 'ТТ' || tt === 'Название ТТ') return;
     const workType = getCell(cells, cm.workType);
-    if (workType === 'Модель') continue;
+    if (workType === 'Модель') return;
     const qty = parseInt(getCell(cells, cm.quantity), 10);
+    const formatIdx = typeof cm.format === 'number' ? cm.format : 13;
+    const format =
+      getCell(cells, formatIdx) ||
+      (lastNonEmptyCell(cells) && !/давальческ/i.test(lastNonEmptyCell(cells))
+        ? lastNonEmptyCell(cells)
+        : '');
     out.push({
       tt,
       rcc: getCell(cells, cm.orderRcc),
@@ -701,10 +823,115 @@ export function extractLegacyRecords(rows, col = {}) {
       area: getCell(cells, cm.area),
       date1: getCell(cells, cm.date1),
       date2: getCell(cells, cm.date2),
-      format: lastNonEmptyCell(cells),
+      dates: [getCell(cells, cm.date1), getCell(cells, cm.date2)].filter(Boolean),
+      format,
+    });
+  });
+  return out;
+}
+
+/**
+ * @param {string[][]} matrix
+ * @param {string} [fileName]
+ * @returns {'zakaz'|'montage'|'unknown'}
+ */
+export function classifyAttachmentMatrix(matrix, fileName = '') {
+  const base = String(fileName).split(/[/\\]/).pop() || '';
+  if (detectInputKind(matrix) === 'zakaz') return 'zakaz';
+  if (/заказ/i.test(base) && /RCC-/i.test(base)) return 'zakaz';
+
+  const head = matrix
+    .slice(0, 5)
+    .map((r) => normalizeCells(r).join('\t'))
+    .join('\n');
+  if (/(?:^|\t)ТТ(?:\t|$)/m.test(head) && /Адрес/i.test(head)) return 'montage';
+  if (/монтаж/i.test(base) || /солюшн/i.test(base) || /эдтех/i.test(base)) return 'montage';
+
+  const legacyProbe = extractLegacyRecords(matrix);
+  if (legacyProbe.length >= 3) return 'montage';
+  return 'unknown';
+}
+
+/**
+ * Справочник по ТТ из выгрузки монтажей: полный адрес, формат, площадь, даты.
+ * @param {SourceRecord[]} montageRecords
+ */
+export function buildTtEnrichmentIndex(montageRecords) {
+  /** @type {Map<string, {addresses: string[], formats: string[], areas: string[], dates: string[]}>} */
+  const acc = new Map();
+  for (const rec of montageRecords) {
+    const tt = String(rec.tt ?? '').trim();
+    if (!tt) continue;
+    let e = acc.get(tt);
+    if (!e) {
+      e = { addresses: [], formats: [], areas: [], dates: [] };
+      acc.set(tt, e);
+    }
+    if (rec.address) e.addresses.push(rec.address);
+    if (rec.format) e.formats.push(rec.format);
+    if (rec.area) e.areas.push(String(rec.area));
+    if (Array.isArray(rec.dates)) e.dates.push(...rec.dates);
+    else {
+      if (rec.date1) e.dates.push(rec.date1);
+      if (rec.date2) e.dates.push(rec.date2);
+    }
+  }
+
+  /** @type {Map<string, {address: string, format: string, area: string, dates: string[]}>} */
+  const out = new Map();
+  for (const [tt, e] of acc) {
+    out.set(tt, {
+      address: pickBestAddress(e.addresses),
+      format: mostCommonNonEmpty(e.formats),
+      area: e.areas.find((a) => parseArea(a) != null) || e.areas[0] || '',
+      dates: [...new Set(e.dates.filter(Boolean))],
     });
   }
   return out;
+}
+
+/**
+ * Подставляет в позиции заказа адрес/формат/площадь/даты из выгрузки монтажей.
+ * @param {SourceRecord[]} orderRecords
+ * @param {ReturnType<typeof buildTtEnrichmentIndex>} index
+ * @param {string[]} [warnings]
+ */
+export function enrichOrderRecords(orderRecords, index, warnings = []) {
+  const warnedTt = new Set();
+  return orderRecords.map((rec) => {
+    const info = index.get(rec.tt);
+    if (!info) {
+      if (isAddressIncomplete(rec.address) && !warnedTt.has(rec.tt)) {
+        warnedTt.add(rec.tt);
+        warnings.push(
+          `Неполный адрес и нет строки в выгрузке монтажей для «${rec.tt}»: "${rec.address}"`,
+        );
+      }
+      return { ...rec, dates: [rec.date1, rec.date2].filter(Boolean) };
+    }
+
+    const next = { ...rec };
+    /** Адрес/формат/площадь из выгрузки монтажей приоритетнее (заказ часто обрезан). */
+    if (info.address) {
+      if (isAddressIncomplete(rec.address) && rec.address !== info.address && !warnedTt.has(`fix:${rec.tt}`)) {
+        warnedTt.add(`fix:${rec.tt}`);
+        warnings.push(
+          `Адрес «${rec.tt}» дополнен из выгрузки монтажей: «${rec.address || '∅'}» → «${info.address}»`,
+        );
+      }
+      next.address = info.address;
+    }
+    if (info.format) next.format = info.format;
+    if (info.area) next.area = info.area;
+    next.dates = [
+      ...new Set(
+        [rec.date1, rec.date2, ...(info.dates || [])]
+          .map((d) => String(d ?? '').trim())
+          .filter(Boolean),
+      ),
+    ];
+    return next;
+  });
 }
 
 /**
@@ -770,10 +997,14 @@ export function groupAndAggregateRecords(records, warn = []) {
     const areaNum = parseArea(rec.area);
     if (areaNum != null) agg.areaValues.push(areaNum);
 
-    agg.dateVals.push(parseRuDate(rec.date1), parseRuDate(rec.date2));
+    const dateRawList =
+      Array.isArray(rec.dates) && rec.dates.length
+        ? rec.dates
+        : [rec.date1, rec.date2];
+    for (const d of dateRawList) agg.dateVals.push(parseFlexibleDate(d));
 
     const fmt = String(rec.format ?? '').trim();
-    if (fmt) agg.formats.push(fmt);
+    if (fmt && !/давальческ/i.test(fmt)) agg.formats.push(fmt);
   }
 
   map.forEach((agg, tt) => {
@@ -891,6 +1122,17 @@ export function ttHasAttention(tt, warnings) {
 export function transformFromMatrix(parsedRows, opts = {}) {
   const warnings = opts.warnings ?? [];
   const { kind, records } = normalizeMatrixToRecords(parsedRows, opts);
+  if (kind === 'zakaz') {
+    const seen = new Set();
+    for (const rec of records) {
+      if (isAddressIncomplete(rec.address) && !seen.has(rec.tt)) {
+        seen.add(rec.tt);
+        warnings.push(
+          `Неполный адрес у «${rec.tt}»: "${rec.address}" — лучше загрузить ZIP с выгрузкой «Эдтех Солюшн монтажи»`,
+        );
+      }
+    }
+  }
   const groupMap = groupAndAggregateRecords(records, warnings);
   const outRows = buildOutputRows(groupMap, opts);
 
@@ -902,6 +1144,82 @@ export function transformFromMatrix(parsedRows, opts = {}) {
     warningsByTtFlags,
     inputKind: kind,
     sourceRecords: records.length,
+  };
+}
+
+/**
+ * Пакет вложений (ZIP или несколько xlsx): заказ(ы) + выгрузка монтажей.
+ * Количества — из заказа; адрес/формат/площадь/даты открытия — дополняются из монтажей.
+ * @param {AttachmentFile[]} files
+ * @param {TransformOptions & {warnings?: string[]}} opts
+ */
+export function processAttachmentBundle(files, opts = {}) {
+  const warnings = opts.warnings ?? [];
+  /** @type {SourceRecord[]} */
+  let orderRecords = [];
+  /** @type {SourceRecord[]} */
+  let montageRecords = [];
+  /** @type {string[]} */
+  const zakazFiles = [];
+  /** @type {string[]} */
+  const montageFiles = [];
+
+  for (const f of files) {
+    const role = classifyAttachmentMatrix(f.matrix, f.name);
+    if (role === 'zakaz') {
+      orderRecords = orderRecords.concat(extractZakazRecords(f.matrix));
+      zakazFiles.push(f.name);
+    } else if (role === 'montage') {
+      montageRecords = montageRecords.concat(extractLegacyRecords(f.matrix));
+      montageFiles.push(f.name);
+    } else {
+      warnings.push(`Пропущен файл без распознанной таблицы: ${f.name}`);
+    }
+  }
+
+  /** @type {SourceRecord[]} */
+  let records;
+  /** @type {string} */
+  let mode;
+
+  if (orderRecords.length && montageRecords.length) {
+    const index = buildTtEnrichmentIndex(montageRecords);
+    records = enrichOrderRecords(orderRecords, index, warnings);
+    mode = 'zakaz+montage';
+  } else if (orderRecords.length) {
+    records = orderRecords.map((r) => ({
+      ...r,
+      dates: [r.date1, r.date2].filter(Boolean),
+    }));
+    mode = 'zakaz';
+    const seen = new Set();
+    for (const rec of records) {
+      if (isAddressIncomplete(rec.address) && !seen.has(rec.tt)) {
+        seen.add(rec.tt);
+        warnings.push(
+          `Неполный адрес у «${rec.tt}»: "${rec.address}" — в архиве нет выгрузки монтажей`,
+        );
+      }
+    }
+  } else if (montageRecords.length) {
+    records = montageRecords;
+    mode = 'montage';
+  } else {
+    throw new Error('Не найдено ни файла заказа, ни выгрузки монтажей (.xlsx)');
+  }
+
+  const groupMap = groupAndAggregateRecords(records, warnings);
+  const outRows = buildOutputRows(groupMap, opts);
+  const warningsByTtFlags = outRows.map((r) => ttHasAttention(String(r['Название ТТ']), warnings));
+
+  return {
+    rows: outRows,
+    warnings,
+    warningsByTtFlags,
+    inputKind: mode,
+    sourceRecords: records.length,
+    zakazFiles,
+    montageFiles,
   };
 }
 
