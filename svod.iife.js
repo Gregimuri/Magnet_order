@@ -542,8 +542,8 @@
         return { ...rec, dates: [rec.date1, rec.date2].filter(Boolean) };
       }
       const next = { ...rec };
-      if (info.address) {
-        if (isAddressIncomplete(rec.address) && rec.address !== info.address && !warnedTt.has(`fix:${rec.tt}`)) {
+      if (isAddressIncomplete(rec.address) && info.address) {
+        if (!warnedTt.has(`fix:${rec.tt}`)) {
           warnedTt.add(`fix:${rec.tt}`);
           warnings.push(
             `\u0410\u0434\u0440\u0435\u0441 \xAB${rec.tt}\xBB \u0434\u043E\u043F\u043E\u043B\u043D\u0435\u043D \u0438\u0437 \u0432\u044B\u0433\u0440\u0443\u0437\u043A\u0438 \u043C\u043E\u043D\u0442\u0430\u0436\u0435\u0439: \xAB${rec.address || "\u2205"}\xBB \u2192 \xAB${info.address}\xBB`
@@ -551,8 +551,8 @@
         }
         next.address = info.address;
       }
-      if (info.format) next.format = info.format;
-      if (info.area) next.area = info.area;
+      if (!next.format && info.format) next.format = info.format;
+      if (!next.area && info.area) next.area = info.area;
       next.dates = [
         ...new Set(
           [rec.date1, rec.date2, ...info.dates || []].map((d) => String(d ?? "").trim()).filter(Boolean)

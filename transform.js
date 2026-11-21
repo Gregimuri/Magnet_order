@@ -911,9 +911,9 @@ export function enrichOrderRecords(orderRecords, index, warnings = []) {
     }
 
     const next = { ...rec };
-    /** Адрес/формат/площадь из выгрузки монтажей приоритетнее (заказ часто обрезан). */
-    if (info.address) {
-      if (isAddressIncomplete(rec.address) && rec.address !== info.address && !warnedTt.has(`fix:${rec.tt}`)) {
+    /** Адрес (и область из него) — из заказа; выгрузка монтажей только если адрес неполный. */
+    if (isAddressIncomplete(rec.address) && info.address) {
+      if (!warnedTt.has(`fix:${rec.tt}`)) {
         warnedTt.add(`fix:${rec.tt}`);
         warnings.push(
           `Адрес «${rec.tt}» дополнен из выгрузки монтажей: «${rec.address || '∅'}» → «${info.address}»`,
@@ -921,8 +921,9 @@ export function enrichOrderRecords(orderRecords, index, warnings = []) {
       }
       next.address = info.address;
     }
-    if (info.format) next.format = info.format;
-    if (info.area) next.area = info.area;
+    /** Формат и площадь в заказе обычно нет — берём из монтажей. */
+    if (!next.format && info.format) next.format = info.format;
+    if (!next.area && info.area) next.area = info.area;
     next.dates = [
       ...new Set(
         [rec.date1, rec.date2, ...(info.dates || [])]
@@ -1149,7 +1150,7 @@ export function transformFromMatrix(parsedRows, opts = {}) {
 
 /**
  * Пакет вложений (ZIP или несколько xlsx): заказ(ы) + выгрузка монтажей.
- * Количества — из заказа; адрес/формат/площадь/даты открытия — дополняются из монтажей.
+ * Количества и адрес — из заказа; неполный адрес / формат / площадь / даты — из монтажей.
  * @param {AttachmentFile[]} files
  * @param {TransformOptions & {warnings?: string[]}} opts
  */
